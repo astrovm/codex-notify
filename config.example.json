@@ -1,0 +1,17 @@
+{
+  "destinations": [
+    {
+      "type": "ntfy",
+      "url": "https://ntfy.sh/REPLACE_WITH_A_PRIVATE_TOPIC"
+    },
+    {
+      "type": "telegram",
+      "bot_token": "REPLACE_WITH_YOUR_BOT_TOKEN",
+      "chat_id": "123456789"
+    }
+  ],
+  "presence": {
+    "enabled": false,
+    "grace_seconds": 8
+  }
+}

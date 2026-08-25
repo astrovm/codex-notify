@@ -1,0 +1,21 @@
+{
+  "name": "codex-notify",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.0",
+  "scripts": {
+    "build": "bun build ./src/codex-notify.ts --compile --outfile ./dist/codex-notify && cp ./codex-notify-active-window.js ./dist/codex-notify-active-window.js",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dbus-next": "0.10.2",
+    "debug": "^4.4.3",
+    "x11": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}
