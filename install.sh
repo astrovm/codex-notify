@@ -10,7 +10,7 @@ if ! command -v bun >/dev/null 2>&1; then
 fi
 
 mkdir -p "$binary_directory"
-bun install --frozen-lockfile --omit=optional --cwd "$source_directory"
+bun install --frozen-lockfile --cwd "$source_directory"
 bun build "$source_directory/src/codex-notify.ts" --compile --external=usocket --external=x11 --outfile "$binary_directory/codex-notify"
 chmod 700 "$binary_directory/codex-notify"
 install -m 600 "$source_directory/codex-notify-active-window.js" "$binary_directory/codex-notify-active-window.js"
