@@ -1,0 +1,7 @@
+{
+  "name": "usocket",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Dependency-free compatibility stub; codex-notify uses a filesystem D-Bus socket",
+  "main": "index.js"
+}

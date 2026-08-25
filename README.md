@@ -146,6 +146,7 @@ On Linux, input activity uses read-only access to `/dev/input/event*`; active-wi
 
 ```sh
 bun install --frozen-lockfile
+bun run audit
 bun run typecheck
 bun test
 bun run build
