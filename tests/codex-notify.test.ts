@@ -11,6 +11,7 @@ import {
   notificationText,
   processTurn,
   readTurnStatus,
+  sessionBusAddress,
   sendDestination,
   turnDigest,
   type Destination,
@@ -155,6 +156,31 @@ describe("destinations", () => {
 });
 
 describe("presence primitives", () => {
+  test("uses the configured session bus address", () => {
+    expect(
+      sessionBusAddress(
+        { DBUS_SESSION_BUS_ADDRESS: "unix:path=/synthetic/session-bus" },
+        1000,
+      ),
+    ).toBe("unix:path=/synthetic/session-bus");
+  });
+
+  test("derives a session bus path without X11", () => {
+    expect(sessionBusAddress({ XDG_RUNTIME_DIR: "/synthetic/runtime" }, 1000)).toBe(
+      "unix:path=/synthetic/runtime/bus",
+    );
+    expect(sessionBusAddress({}, 1001)).toBe("unix:path=/run/user/1001/bus");
+    expect(
+      sessionBusAddress(
+        {
+          DBUS_SESSION_BUS_ADDRESS: "unix:abstract=/synthetic/unsupported",
+          XDG_RUNTIME_DIR: "/synthetic/runtime",
+        },
+        1000,
+      ),
+    ).toBe("unix:path=/synthetic/runtime/bus");
+  });
+
   test("filters Linux input events", () => {
     expect(isActivityEvent(1, 1)).toBe(true);
     expect(isActivityEvent(1, 0)).toBe(false);

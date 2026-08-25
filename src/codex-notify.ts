@@ -310,6 +310,19 @@ export function linuxSessionIsUnlocked(): boolean {
   return properties.get("Active") === "yes" && properties.get("LockedHint") === "no";
 }
 
+export function sessionBusAddress(
+  environment: NodeJS.ProcessEnv = process.env,
+  userId = process.getuid?.() ?? 0,
+): string {
+  const configured = environment.DBUS_SESSION_BUS_ADDRESS?.trim();
+  const configuredPath = configured
+    ?.split(";")
+    .find((address) => address.startsWith("unix:path="));
+  if (configuredPath) return configuredPath;
+  const runtimeDirectory = environment.XDG_RUNTIME_DIR?.trim() || `/run/user/${userId}`;
+  return `unix:path=${join(runtimeDirectory, "bus")}`;
+}
+
 function activeWindowScriptPath(): string {
   const besideExecutable = join(dirname(process.execPath), "codex-notify-active-window.js");
   if (existsSync(besideExecutable)) return besideExecutable;
@@ -335,7 +348,7 @@ async function withPresenceLock<T>(work: () => Promise<T>): Promise<T | null> {
 export async function queryKdeActiveWindow(): Promise<Record<string, string> | null> {
   return withPresenceLock(async () => {
     const dbus = await import("dbus-next");
-    const bus = dbus.sessionBus();
+    const bus = dbus.sessionBus({ busAddress: sessionBusAddress() });
     bus.on("error", () => {
       // A missing desktop session makes the active-window probe unavailable.
     });

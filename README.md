@@ -27,7 +27,7 @@ To build and install manually:
 ```sh
 git clone https://github.com/astrovm/codex-notify.git
 cd codex-notify
-bun install --frozen-lockfile
+bun install --frozen-lockfile --omit=optional
 bun run build
 mkdir -p "$HOME/.local/bin"
 install -m700 dist/codex-notify "$HOME/.local/bin/codex-notify"
@@ -145,7 +145,8 @@ On Linux, input activity uses read-only access to `/dev/input/event*`; active-wi
 ## Test
 
 ```sh
-bun install --frozen-lockfile
+bun install --frozen-lockfile --omit=optional
+bun run audit
 bun run typecheck
 bun test
 bun run build
