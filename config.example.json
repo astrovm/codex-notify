@@ -11,7 +11,7 @@
     }
   ],
   "presence": {
-    "enabled": false,
+    "enabled": true,
     "grace_seconds": 8
   }
 }
