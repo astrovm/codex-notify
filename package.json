@@ -7,6 +7,8 @@
   "scripts": {
     "audit": "bun audit",
     "build": "bun build ./src/codex-notify.ts --compile --external=usocket --external=x11 --outfile ./dist/codex-notify && cp ./codex-notify-active-window.js ./dist/codex-notify-active-window.js",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
@@ -15,6 +17,7 @@
   },
   "devDependencies": {
     "@types/bun": "1.4.0",
+    "prettier": "3.9.6",
     "typescript": "7.0.2"
   },
   "overrides": {

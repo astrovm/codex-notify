@@ -17,6 +17,8 @@ jobs:
           bun-version: 1.4.0
       - run: bun install --frozen-lockfile
       - run: bun run audit
+      - run: bun run format:check
+        if: matrix.os == 'ubuntu-latest'
       - run: bun run typecheck
       - run: bun test
       - run: bun run build
