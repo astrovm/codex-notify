@@ -129,7 +129,7 @@ Presence suppression is enabled by default. It skips remote notifications only w
 ```json
 {
   "destinations": [
-    {"type": "ntfy", "url": "https://ntfy.sh/REPLACE_WITH_A_PRIVATE_TOPIC"}
+    { "type": "ntfy", "url": "https://ntfy.sh/REPLACE_WITH_A_PRIVATE_TOPIC" }
   ],
   "presence": {
     "enabled": true,

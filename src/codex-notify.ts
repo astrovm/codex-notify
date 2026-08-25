@@ -23,7 +23,11 @@ import { homedir, platform } from "node:os";
 
 export const POLL_MILLISECONDS = 250;
 export const MAX_WAIT_MILLISECONDS = 24 * 60 * 60 * 1_000;
-export const TERMINAL_TURN_STATUSES = new Set(["completed", "failed", "interrupted"]);
+export const TERMINAL_TURN_STATUSES = new Set([
+  "completed",
+  "failed",
+  "interrupted",
+]);
 
 const INPUT_EVENT_SIZE = 24;
 const INPUT_EVENT_TYPE_OFFSET = 16;
@@ -73,7 +77,10 @@ export interface WorkerRequest {
 export interface ProcessTurnOptions {
   statusReader?: (threadId: string, turnId: string) => TurnStatus | null;
   acknowledgementChecker?: (graceSeconds: number) => Promise<boolean>;
-  sender?: (destination: Destination, status: TerminalStatus) => Promise<boolean>;
+  sender?: (
+    destination: Destination,
+    status: TerminalStatus,
+  ) => Promise<boolean>;
   sleep?: (milliseconds: number) => Promise<void>;
   now?: () => number;
   maximumWaitMilliseconds?: number;
@@ -96,7 +103,13 @@ export function configPath(): string {
   const override = envPath("CODEX_NOTIFY_CONFIG");
   if (override) return override;
   if (platform() === "darwin") {
-    return join(homedir(), "Library", "Application Support", "codex-notify", "config.json");
+    return join(
+      homedir(),
+      "Library",
+      "Application Support",
+      "codex-notify",
+      "config.json",
+    );
   }
   const root = envPath("XDG_CONFIG_HOME") ?? join(homedir(), ".config");
   return join(root, "codex-notify", "config.json");
@@ -106,14 +119,23 @@ export function stateDirectory(): string {
   const override = envPath("CODEX_NOTIFY_STATE_DIRECTORY");
   if (override) return override;
   if (platform() === "darwin") {
-    return join(homedir(), "Library", "Application Support", "codex-notify", "state");
+    return join(
+      homedir(),
+      "Library",
+      "Application Support",
+      "codex-notify",
+      "state",
+    );
   }
   const root = envPath("XDG_STATE_HOME") ?? join(homedir(), ".local", "state");
   return join(root, "codex-notify");
 }
 
 export function historyDatabase(): string {
-  return envPath("CODEX_NOTIFY_HISTORY_DATABASE") ?? join(codexHome(), "thread_history_1.sqlite");
+  return (
+    envPath("CODEX_NOTIFY_HISTORY_DATABASE") ??
+    join(codexHome(), "thread_history_1.sqlite")
+  );
 }
 
 function requirePrivateFile(path: string): void {
@@ -121,10 +143,14 @@ function requirePrivateFile(path: string): void {
   try {
     mode = statSync(path).mode & 0o777;
   } catch (error) {
-    throw new ConfigError(`configuration file not found: ${path}`, { cause: error });
+    throw new ConfigError(`configuration file not found: ${path}`, {
+      cause: error,
+    });
   }
   if ((mode & 0o077) !== 0) {
-    throw new ConfigError(`configuration must not be accessible by group or others: ${path}`);
+    throw new ConfigError(
+      `configuration must not be accessible by group or others: ${path}`,
+    );
   }
 }
 
@@ -148,7 +174,9 @@ function validateDestination(value: unknown): asserts value is Destination {
     }
     return;
   }
-  throw new ConfigError(`unsupported destination type: ${String(destination.type)}`);
+  throw new ConfigError(
+    `unsupported destination type: ${String(destination.type)}`,
+  );
 }
 
 export function loadConfig(path = configPath()): NotifyConfig {
@@ -168,15 +196,29 @@ export function loadConfig(path = configPath()): NotifyConfig {
   }
   config.destinations.forEach(validateDestination);
   if (config.presence !== undefined) {
-    if (!config.presence || typeof config.presence !== "object" || Array.isArray(config.presence)) {
+    if (
+      !config.presence ||
+      typeof config.presence !== "object" ||
+      Array.isArray(config.presence)
+    ) {
       throw new ConfigError("presence must be a JSON object");
     }
-    if (config.presence.enabled !== undefined && typeof config.presence.enabled !== "boolean") {
+    if (
+      config.presence.enabled !== undefined &&
+      typeof config.presence.enabled !== "boolean"
+    ) {
       throw new ConfigError("presence.enabled must be true or false");
     }
     const grace = config.presence.grace_seconds ?? 8;
-    if (typeof grace !== "number" || !Number.isFinite(grace) || grace < 0 || grace > 300) {
-      throw new ConfigError("presence.grace_seconds must be a number from 0 to 300");
+    if (
+      typeof grace !== "number" ||
+      !Number.isFinite(grace) ||
+      grace < 0 ||
+      grace > 300
+    ) {
+      throw new ConfigError(
+        "presence.grace_seconds must be a number from 0 to 300",
+      );
     }
   }
   return config as NotifyConfig;
@@ -191,7 +233,9 @@ export function turnDigest(threadId: string, turnId: string): string {
 }
 
 export function destinationDigest(destination: Destination): string {
-  const sorted = Object.fromEntries(Object.entries(destination).sort(([a], [b]) => a.localeCompare(b)));
+  const sorted = Object.fromEntries(
+    Object.entries(destination).sort(([a], [b]) => a.localeCompare(b)),
+  );
   return hash(sorted).slice(0, 16);
 }
 
@@ -205,8 +249,13 @@ export function readTurnStatus(
   try {
     database = new Database(databasePath, { readonly: true, strict: true });
     const row = database
-      .query("SELECT status, completed_at FROM thread_turns WHERE thread_id = ? AND turn_id = ?")
-      .get(threadId, turnId) as { status: unknown; completed_at: unknown } | null;
+      .query(
+        "SELECT status, completed_at FROM thread_turns WHERE thread_id = ? AND turn_id = ?",
+      )
+      .get(threadId, turnId) as {
+      status: unknown;
+      completed_at: unknown;
+    } | null;
     if (!row) return null;
     return {
       status: String(row.status),
@@ -224,18 +273,27 @@ export function isActivityEvent(eventType: number, value: number): boolean {
   return (eventType === EV_REL || eventType === EV_ABS) && value !== 0;
 }
 
-export async function linuxActivityAfterCompletion(timeoutSeconds: number): Promise<boolean> {
+export async function linuxActivityAfterCompletion(
+  timeoutSeconds: number,
+): Promise<boolean> {
   const descriptors: number[] = [];
   try {
     let names: string[];
     try {
-      names = readdirSync("/dev/input").filter((name) => name.startsWith("event"));
+      names = readdirSync("/dev/input").filter((name) =>
+        name.startsWith("event"),
+      );
     } catch {
       return false;
     }
     for (const name of names) {
       try {
-        descriptors.push(openSync(join("/dev/input", name), constants.O_RDONLY | constants.O_NONBLOCK));
+        descriptors.push(
+          openSync(
+            join("/dev/input", name),
+            constants.O_RDONLY | constants.O_NONBLOCK,
+          ),
+        );
       } catch {
         // A missing or unreadable input device makes this probe less complete, not fatal.
       }
@@ -249,7 +307,9 @@ export async function linuxActivityAfterCompletion(timeoutSeconds: number): Prom
           const length = readSync(descriptor, buffer, 0, buffer.length, null);
           const complete = length - (length % INPUT_EVENT_SIZE);
           for (let offset = 0; offset < complete; offset += INPUT_EVENT_SIZE) {
-            const eventType = buffer.readUInt16LE(offset + INPUT_EVENT_TYPE_OFFSET);
+            const eventType = buffer.readUInt16LE(
+              offset + INPUT_EVENT_TYPE_OFFSET,
+            );
             const value = buffer.readInt32LE(offset + INPUT_EVENT_VALUE_OFFSET);
             if (isActivityEvent(eventType, value)) return true;
           }
@@ -280,7 +340,11 @@ interface CommandResult {
 
 function run(command: string[]): CommandResult {
   try {
-    const result = Bun.spawnSync({ cmd: command, stdout: "pipe", stderr: "pipe" });
+    const result = Bun.spawnSync({
+      cmd: command,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
     return {
       success: result.success,
       stdout: result.stdout.toString().trim(),
@@ -292,18 +356,34 @@ function run(command: string[]): CommandResult {
 }
 
 function debug(message: string): void {
-  if (process.env.CODEX_NOTIFY_DEBUG === "1") console.error(`codex-notify debug: ${message}`);
+  if (process.env.CODEX_NOTIFY_DEBUG === "1")
+    console.error(`codex-notify debug: ${message}`);
 }
 
 export function linuxSessionIsUnlocked(): boolean {
   let sessionId = process.env.XDG_SESSION_ID?.trim() ?? "";
   if (!sessionId) {
-    const display = run(["loginctl", "show-user", String(process.getuid?.() ?? ""), "-p", "Display", "--value"]);
+    const display = run([
+      "loginctl",
+      "show-user",
+      String(process.getuid?.() ?? ""),
+      "-p",
+      "Display",
+      "--value",
+    ]);
     if (!display.success) return false;
     sessionId = display.stdout;
   }
   if (!sessionId) return false;
-  const result = run(["loginctl", "show-session", sessionId, "-p", "Active", "-p", "LockedHint"]);
+  const result = run([
+    "loginctl",
+    "show-session",
+    sessionId,
+    "-p",
+    "Active",
+    "-p",
+    "LockedHint",
+  ]);
   if (!result.success) return false;
   const properties = new Map(
     result.stdout
@@ -311,7 +391,9 @@ export function linuxSessionIsUnlocked(): boolean {
       .filter((line) => line.includes("="))
       .map((line) => line.split("=", 2) as [string, string]),
   );
-  return properties.get("Active") === "yes" && properties.get("LockedHint") === "no";
+  return (
+    properties.get("Active") === "yes" && properties.get("LockedHint") === "no"
+  );
 }
 
 export function sessionBusAddress(
@@ -323,12 +405,16 @@ export function sessionBusAddress(
     ?.split(";")
     .find((address) => address.startsWith("unix:path="));
   if (configuredPath) return configuredPath;
-  const runtimeDirectory = environment.XDG_RUNTIME_DIR?.trim() || `/run/user/${userId}`;
+  const runtimeDirectory =
+    environment.XDG_RUNTIME_DIR?.trim() || `/run/user/${userId}`;
   return `unix:path=${join(runtimeDirectory, "bus")}`;
 }
 
 function activeWindowScriptPath(): string {
-  const besideExecutable = join(dirname(process.execPath), "codex-notify-active-window.js");
+  const besideExecutable = join(
+    dirname(process.execPath),
+    "codex-notify-active-window.js",
+  );
   if (existsSync(besideExecutable)) return besideExecutable;
   return join(import.meta.dir, "..", "codex-notify-active-window.js");
 }
@@ -349,7 +435,10 @@ async function withPresenceLock<T>(work: () => Promise<T>): Promise<T | null> {
   }
 }
 
-export async function queryKdeActiveWindow(): Promise<Record<string, string> | null> {
+export async function queryKdeActiveWindow(): Promise<Record<
+  string,
+  string
+> | null> {
   return withPresenceLock(async () => {
     const dbus = await import("dbus-next");
     const bus = dbus.sessionBus({ busAddress: sessionBusAddress() });
@@ -368,47 +457,60 @@ export async function queryKdeActiveWindow(): Promise<Record<string, string> | n
       ]);
       debug(`D-Bus requestName result: ${requestResult}`);
       if (requestResult !== 1) return null;
-      const answer = await new Promise<Record<string, string> | null>((resolve) => {
-        let settled = false;
-        const finish = (value: Record<string, string> | null) => {
-          if (settled) return;
-          settled = true;
-          resolve(value);
-        };
-        bus.addMethodHandler((message: any) => {
-          if (message.path !== path || message.interface !== iface || message.member !== "Report") {
-            return false;
+      const answer = await new Promise<Record<string, string> | null>(
+        (resolve) => {
+          let settled = false;
+          const finish = (value: Record<string, string> | null) => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+          };
+          bus.addMethodHandler((message: any) => {
+            if (
+              message.path !== path ||
+              message.interface !== iface ||
+              message.member !== "Report"
+            ) {
+              return false;
+            }
+            const [resourceClass = "", caption = "", pid = ""] =
+              message.body ?? [];
+            debug(`KWin reported an active window with PID ${String(pid)}`);
+            bus.send(dbus.Message.newMethodReturn(message, "", []));
+            finish({
+              resourceClass: String(resourceClass),
+              caption: String(caption),
+              pid: String(pid),
+            });
+            return true;
+          });
+          const load = run([
+            "qdbus6",
+            "org.kde.KWin",
+            "/Scripting",
+            "org.kde.kwin.Scripting.loadScript",
+            activeWindowScriptPath(),
+            pluginName,
+          ]);
+          loaded = load.success && Number(load.stdout) >= 0;
+          debug(
+            `KWin loadScript: success=${load.success} stdout=${load.stdout} stderr=${load.stderr}`,
+          );
+          if (!loaded) {
+            finish(null);
+            return;
           }
-          const [resourceClass = "", caption = "", pid = ""] = message.body ?? [];
-          debug(`KWin reported an active window with PID ${String(pid)}`);
-          bus.send(dbus.Message.newMethodReturn(message, "", []));
-          finish({ resourceClass: String(resourceClass), caption: String(caption), pid: String(pid) });
-          return true;
-        });
-        const load = run([
-          "qdbus6",
-          "org.kde.KWin",
-          "/Scripting",
-          "org.kde.kwin.Scripting.loadScript",
-          activeWindowScriptPath(),
-          pluginName,
-        ]);
-        loaded = load.success && Number(load.stdout) >= 0;
-        debug(`KWin loadScript: success=${load.success} stdout=${load.stdout} stderr=${load.stderr}`);
-        if (!loaded) {
-          finish(null);
-          return;
-        }
-        const start = run([
-          "qdbus6",
-          "org.kde.KWin",
-          "/Scripting",
-          "org.kde.kwin.Scripting.start",
-        ]);
-        debug(`KWin start: success=${start.success} stderr=${start.stderr}`);
-        if (!start.success) finish(null);
-        setTimeout(() => finish(null), 2_000).unref();
-      });
+          const start = run([
+            "qdbus6",
+            "org.kde.KWin",
+            "/Scripting",
+            "org.kde.kwin.Scripting.start",
+          ]);
+          debug(`KWin start: success=${start.success} stderr=${start.stderr}`);
+          if (!start.success) finish(null);
+          setTimeout(() => finish(null), 2_000).unref();
+        },
+      );
       return answer;
     } catch (error) {
       debug(`KDE active-window error: ${String(error)}`);
@@ -436,10 +538,17 @@ export async function linuxCodexIsActive(): Promise<boolean> {
   const window = await queryKdeActiveWindow();
   if (!window) return false;
   const resourceClass = window.resourceClass?.toLowerCase() ?? "";
-  if (["codex", "chatgpt", "chat-gpt"].some((name) => resourceClass.includes(name))) return true;
+  if (
+    ["codex", "chatgpt", "chat-gpt"].some((name) =>
+      resourceClass.includes(name),
+    )
+  )
+    return true;
   if (!/^\d+$/.test(window.pid ?? "")) return false;
   try {
-    const processName = readFileSync(`/proc/${window.pid}/comm`, "utf8").trim().toLowerCase();
+    const processName = readFileSync(`/proc/${window.pid}/comm`, "utf8")
+      .trim()
+      .toLowerCase();
     return processName === "chatgpt" || processName === "codex";
   } catch {
     return false;
@@ -458,7 +567,10 @@ export function macIdleSeconds(): number | null {
       },
     );
     try {
-      const value = library.symbols.CGEventSourceSecondsSinceLastEventType(0, 0xffff_ffff);
+      const value = library.symbols.CGEventSourceSecondsSinceLastEventType(
+        0,
+        0xffff_ffff,
+      );
       return Number.isFinite(value) && value >= 0 ? value : null;
     } finally {
       library.close();
@@ -482,13 +594,16 @@ export function macCodexIsActive(): boolean {
   return lower.includes('"chatgpt"') || lower.includes('"codex"');
 }
 
-export async function userAcknowledgedCompletion(graceSeconds: number): Promise<boolean> {
+export async function userAcknowledgedCompletion(
+  graceSeconds: number,
+): Promise<boolean> {
   const grace = Math.max(0, graceSeconds);
   if (platform() === "darwin") {
     const started = performance.now();
     await Bun.sleep(grace * 1_000);
     const idle = macIdleSeconds();
-    if (idle === null || idle + 0.25 >= (performance.now() - started) / 1_000) return false;
+    if (idle === null || idle + 0.25 >= (performance.now() - started) / 1_000)
+      return false;
     return macSessionIsUnlocked() && macCodexIsActive();
   }
   if (platform() === "linux") {
@@ -499,11 +614,23 @@ export async function userAcknowledgedCompletion(graceSeconds: number): Promise<
   return false;
 }
 
-export function notificationText(status: TerminalStatus): { title: string; body: string; tags: string } {
+export function notificationText(status: TerminalStatus): {
+  title: string;
+  body: string;
+  tags: string;
+} {
   if (status === "completed") {
-    return { title: "Codex task finished", body: "Codex task finished.", tags: "white_check_mark" };
+    return {
+      title: "Codex task finished",
+      body: "Codex task finished.",
+      tags: "white_check_mark",
+    };
   }
-  return { title: "Codex task ended", body: `Codex task ended: ${status}.`, tags: "warning" };
+  return {
+    title: "Codex task ended",
+    body: `Codex task ended: ${status}.`,
+    tags: "warning",
+  };
 }
 
 export async function sendDestination(
@@ -526,7 +653,10 @@ export async function sendDestination(
       `https://api.telegram.org/bot${destination.bot_token}/sendMessage`,
       {
         method: "POST",
-        body: JSON.stringify({ chat_id: destination.chat_id, text: `${title}\n${body}` }),
+        body: JSON.stringify({
+          chat_id: destination.chat_id,
+          text: `${title}\n${body}`,
+        }),
         headers: { "Content-Type": "application/json" },
         signal: AbortSignal.timeout(10_000),
       },
@@ -541,7 +671,10 @@ export async function sendDestination(
 
 function writeMarker(path: string, outcome: string): void {
   const temporary = `${path}.${process.pid}.tmp`;
-  writeFileSync(temporary, `${outcome} ${Math.floor(Date.now() / 1_000)}\n`, { mode: 0o600, flag: "wx" });
+  writeFileSync(temporary, `${outcome} ${Math.floor(Date.now() / 1_000)}\n`, {
+    mode: 0o600,
+    flag: "wx",
+  });
   renameSync(temporary, path);
 }
 
@@ -549,7 +682,12 @@ async function waitForTerminalStatus(
   threadId: string,
   turnId: string,
   fallbackStatus: TerminalStatus,
-  options: Required<Pick<ProcessTurnOptions, "statusReader" | "sleep" | "now" | "maximumWaitMilliseconds">> & {
+  options: Required<
+    Pick<
+      ProcessTurnOptions,
+      "statusReader" | "sleep" | "now" | "maximumWaitMilliseconds"
+    >
+  > & {
     historyPath: string;
   },
 ): Promise<TerminalStatus | null> {
@@ -564,7 +702,10 @@ async function waitForTerminalStatus(
   return turn.status as TerminalStatus;
 }
 
-function acquireTurnLock(path: string, maximumWaitMilliseconds: number): boolean {
+function acquireTurnLock(
+  path: string,
+  maximumWaitMilliseconds: number,
+): boolean {
   try {
     mkdirSync(path, { mode: 0o700 });
     return true;
@@ -592,23 +733,32 @@ export async function processTurn(
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const digest = turnDigest(threadId, turnId);
   const skippedMarker = join(directory, `skipped-${digest}`);
-  const maximumWaitMilliseconds = supplied.maximumWaitMilliseconds ?? MAX_WAIT_MILLISECONDS;
+  const maximumWaitMilliseconds =
+    supplied.maximumWaitMilliseconds ?? MAX_WAIT_MILLISECONDS;
   const lock = join(directory, `worker-${digest}.lock`);
   if (!acquireTurnLock(lock, maximumWaitMilliseconds)) return "worker-active";
   try {
     if (existsSync(skippedMarker)) return "duplicate";
     const historyPath = supplied.historyPath ?? historyDatabase();
-    const status = await waitForTerminalStatus(threadId, turnId, fallbackStatus, {
-      historyPath,
-      statusReader: supplied.statusReader ?? ((thread, turn) => readTurnStatus(thread, turn, historyPath)),
-      sleep: supplied.sleep ?? Bun.sleep,
-      now: supplied.now ?? Date.now,
-      maximumWaitMilliseconds,
-    });
+    const status = await waitForTerminalStatus(
+      threadId,
+      turnId,
+      fallbackStatus,
+      {
+        historyPath,
+        statusReader:
+          supplied.statusReader ??
+          ((thread, turn) => readTurnStatus(thread, turn, historyPath)),
+        sleep: supplied.sleep ?? Bun.sleep,
+        now: supplied.now ?? Date.now,
+        maximumWaitMilliseconds,
+      },
+    );
     if (!status) return "timeout";
     if (presenceSuppressionEnabled(config)) {
       const grace = config.presence?.grace_seconds ?? 8;
-      const acknowledged = supplied.acknowledgementChecker ?? userAcknowledgedCompletion;
+      const acknowledged =
+        supplied.acknowledgementChecker ?? userAcknowledgedCompletion;
       if (await acknowledged(grace)) {
         writeMarker(skippedMarker, "present");
         return "skipped-present";
@@ -643,15 +793,22 @@ export function writeWorkerRequest(request: WorkerRequest): string {
   const digest = turnDigest(request.threadId, request.turnId);
   const path = join(directory, `request-${digest}.json`);
   const temporary = `${path}.${process.pid}.tmp`;
-  writeFileSync(temporary, JSON.stringify(request), { mode: 0o600, flag: "wx" });
+  writeFileSync(temporary, JSON.stringify(request), {
+    mode: 0o600,
+    flag: "wx",
+  });
   renameSync(temporary, path);
   return digest;
 }
 
-export function readWorkerRequest(digest: string): { path: string; request: WorkerRequest } | null {
+export function readWorkerRequest(
+  digest: string,
+): { path: string; request: WorkerRequest } | null {
   const path = join(stateDirectory(), `request-${digest}.json`);
   try {
-    const value = JSON.parse(readFileSync(path, "utf8")) as Partial<WorkerRequest>;
+    const value = JSON.parse(
+      readFileSync(path, "utf8"),
+    ) as Partial<WorkerRequest>;
     if (
       typeof value.threadId !== "string" ||
       typeof value.turnId !== "string" ||
@@ -689,8 +846,12 @@ export function spawnWorker(request: WorkerRequest): void {
 export async function checkConfiguration(): Promise<number> {
   try {
     const config = loadConfig();
-    console.log(`Configuration OK: ${config.destinations.map(({ type }) => type).join(", ")}`);
-    console.log(`Presence suppression: ${presenceSuppressionEnabled(config) ? "enabled" : "disabled"}`);
+    console.log(
+      `Configuration OK: ${config.destinations.map(({ type }) => type).join(", ")}`,
+    );
+    console.log(
+      `Presence suppression: ${presenceSuppressionEnabled(config) ? "enabled" : "disabled"}`,
+    );
     return 0;
   } catch (error) {
     console.error(`codex-notify: ${(error as Error).message}`);
@@ -708,7 +869,8 @@ export async function sendTestNotification(): Promise<number> {
   }
   let failures = 0;
   for (const destination of config.destinations) {
-    if (await sendDestination(destination, "completed")) console.log(`Test sent: ${destination.type}`);
+    if (await sendDestination(destination, "completed"))
+      console.log(`Test sent: ${destination.type}`);
     else {
       console.error(`Test failed: ${destination.type}`);
       failures += 1;
@@ -719,11 +881,19 @@ export async function sendTestNotification(): Promise<number> {
 
 export async function diagnosePlatform(): Promise<number> {
   console.log(`Platform: ${platform()}`);
-  console.log(`Completion database: ${existsSync(historyDatabase()) ? "available" : "hook event fallback"}`);
+  console.log(
+    `Completion database: ${existsSync(historyDatabase()) ? "available" : "hook event fallback"}`,
+  );
   if (platform() === "darwin") {
-    console.log(`Idle-time API: ${macIdleSeconds() === null ? "unavailable" : "available"}`);
-    console.log(`Session unlocked: ${macSessionIsUnlocked() ? "yes" : "no or unavailable"}`);
-    console.log(`Codex active: ${macCodexIsActive() ? "yes" : "no or unavailable"}`);
+    console.log(
+      `Idle-time API: ${macIdleSeconds() === null ? "unavailable" : "available"}`,
+    );
+    console.log(
+      `Session unlocked: ${macSessionIsUnlocked() ? "yes" : "no or unavailable"}`,
+    );
+    console.log(
+      `Codex active: ${macCodexIsActive() ? "yes" : "no or unavailable"}`,
+    );
     return 0;
   }
   if (platform() === "linux") {
@@ -733,7 +903,10 @@ export async function diagnosePlatform(): Promise<number> {
         .filter((name) => name.startsWith("event"))
         .some((name) => {
           try {
-            const descriptor = openSync(join("/dev/input", name), constants.O_RDONLY | constants.O_NONBLOCK);
+            const descriptor = openSync(
+              join("/dev/input", name),
+              constants.O_RDONLY | constants.O_NONBLOCK,
+            );
             closeSync(descriptor);
             return true;
           } catch {
@@ -743,9 +916,15 @@ export async function diagnosePlatform(): Promise<number> {
     } catch {
       // Keep the fail-safe false value.
     }
-    console.log(`Input activity API: ${readableInput ? "available" : "unavailable"}`);
-    console.log(`Session unlocked: ${linuxSessionIsUnlocked() ? "yes" : "no or unavailable"}`);
-    console.log(`Codex active: ${(await linuxCodexIsActive()) ? "yes" : "no or unavailable"}`);
+    console.log(
+      `Input activity API: ${readableInput ? "available" : "unavailable"}`,
+    );
+    console.log(
+      `Session unlocked: ${linuxSessionIsUnlocked() ? "yes" : "no or unavailable"}`,
+    );
+    console.log(
+      `Codex active: ${(await linuxCodexIsActive()) ? "yes" : "no or unavailable"}`,
+    );
     return 0;
   }
   console.log("Presence suppression: unsupported platform");
@@ -754,7 +933,10 @@ export async function diagnosePlatform(): Promise<number> {
 
 function commandLineArguments(): string[] {
   const argumentsAfterExecutable = process.argv.slice(1);
-  if (argumentsAfterExecutable[0] === import.meta.path || argumentsAfterExecutable[0] === process.execPath) {
+  if (
+    argumentsAfterExecutable[0] === import.meta.path ||
+    argumentsAfterExecutable[0] === process.execPath
+  ) {
     return argumentsAfterExecutable.slice(1);
   }
   return argumentsAfterExecutable;
@@ -796,11 +978,19 @@ export async function main(args = commandLineArguments()): Promise<number> {
     return 2;
   }
   if (event.type !== "agent-turn-complete") return 0;
-  if (typeof event["thread-id"] !== "string" || typeof event["turn-id"] !== "string") return 0;
+  if (
+    typeof event["thread-id"] !== "string" ||
+    typeof event["turn-id"] !== "string"
+  )
+    return 0;
   const status = TERMINAL_TURN_STATUSES.has(String(event.status))
     ? (event.status as TerminalStatus)
     : "completed";
-  spawnWorker({ threadId: event["thread-id"], turnId: event["turn-id"], status });
+  spawnWorker({
+    threadId: event["thread-id"],
+    turnId: event["turn-id"],
+    status,
+  });
   return 0;
 }
 
