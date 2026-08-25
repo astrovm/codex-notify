@@ -78,7 +78,7 @@ describe("completion and deduplication", () => {
 
   test("sends every destination once", async () => {
     const state = temporaryDirectory();
-    const config: NotifyConfig = { destinations: [ntfy, telegram] };
+    const config: NotifyConfig = { destinations: [ntfy, telegram], presence: { enabled: false } };
     const sent: string[] = [];
     const sender = async (destination: Destination) => {
       sent.push(destination.type);
@@ -92,7 +92,7 @@ describe("completion and deduplication", () => {
   test("identical destinations are sent once", async () => {
     const state = temporaryDirectory();
     const sender = mock(async () => true);
-    await processTurn({ destinations: [ntfy, { ...ntfy }] }, "thread-1", "turn-2", "completed", {
+    await processTurn({ destinations: [ntfy, { ...ntfy }], presence: { enabled: false } }, "thread-1", "turn-2", "completed", {
       state,
       historyPath: join(state, "missing"),
       sender,
@@ -100,12 +100,12 @@ describe("completion and deduplication", () => {
     expect(sender).toHaveBeenCalledTimes(1);
   });
 
-  test("presence suppression is opt in", async () => {
+  test("presence suppression is enabled by default", async () => {
     const state = temporaryDirectory();
     const sender = mock(async () => true);
     const acknowledgementChecker = mock(async () => true);
     const outcome = await processTurn(
-      { destinations: [ntfy], presence: { enabled: true, grace_seconds: 3 } },
+      { destinations: [ntfy], presence: { grace_seconds: 3 } },
       "thread-1",
       "turn-present",
       "completed",
@@ -116,11 +116,27 @@ describe("completion and deduplication", () => {
     expect(sender).not.toHaveBeenCalled();
   });
 
+  test("presence suppression can be disabled", async () => {
+    const state = temporaryDirectory();
+    const sender = mock(async () => true);
+    const acknowledgementChecker = mock(async () => true);
+    const outcome = await processTurn(
+      { destinations: [ntfy], presence: { enabled: false } },
+      "thread-1",
+      "turn-opt-out",
+      "completed",
+      { state, historyPath: join(state, "missing"), sender, acknowledgementChecker },
+    );
+    expect(outcome).toBe("sent");
+    expect(acknowledgementChecker).not.toHaveBeenCalled();
+    expect(sender).toHaveBeenCalledTimes(1);
+  });
+
   test("uses stable hashes without writing secrets", async () => {
     expect(turnDigest("thread", "turn")).toHaveLength(64);
     expect(destinationDigest(telegram)).toHaveLength(16);
     const state = temporaryDirectory();
-    await processTurn({ destinations: [telegram] }, "thread", "turn", "completed", {
+    await processTurn({ destinations: [telegram], presence: { enabled: false } }, "thread", "turn", "completed", {
       state,
       historyPath: join(state, "missing"),
       sender: async () => true,

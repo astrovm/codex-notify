@@ -118,9 +118,9 @@ When `~/.codex/thread_history_1.sqlite` exists, the notifier also waits until th
 
 Persistent marker files contain hashed event and destination identifiers plus delivery outcomes. A temporary private worker request contains the Codex thread ID, turn ID, and terminal status; it is deleted after successful delivery or presence suppression. State files never contain prompts, responses, destination URLs, bot tokens, or chat IDs.
 
-## Optional presence suppression
+## Presence suppression
 
-Presence suppression is disabled by default. Enable it to skip remote notifications only when all three conditions are confirmed after completion:
+Presence suppression is enabled by default. It skips remote notifications only when all three conditions are confirmed after completion:
 
 1. New keyboard or mouse activity occurs during the grace period.
 2. The session is unlocked.
@@ -137,6 +137,8 @@ Presence suppression is disabled by default. Enable it to skip remote notificati
   }
 }
 ```
+
+To disable presence suppression, set `"presence": { "enabled": false }` in the configuration.
 
 On macOS this uses Core Graphics, `ioreg`, and `lsappinfo`. It does not read key values or mouse coordinates.
 

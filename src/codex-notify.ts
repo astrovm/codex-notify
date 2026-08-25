@@ -55,6 +55,10 @@ export interface NotifyConfig {
   };
 }
 
+function presenceSuppressionEnabled(config: NotifyConfig): boolean {
+  return config.presence?.enabled ?? true;
+}
+
 export interface TurnStatus {
   status: string;
   completedAt: number | null;
@@ -602,8 +606,8 @@ export async function processTurn(
       maximumWaitMilliseconds,
     });
     if (!status) return "timeout";
-    if (config.presence?.enabled) {
-      const grace = config.presence.grace_seconds ?? 8;
+    if (presenceSuppressionEnabled(config)) {
+      const grace = config.presence?.grace_seconds ?? 8;
       const acknowledged = supplied.acknowledgementChecker ?? userAcknowledgedCompletion;
       if (await acknowledged(grace)) {
         writeMarker(skippedMarker, "present");
@@ -686,7 +690,7 @@ export async function checkConfiguration(): Promise<number> {
   try {
     const config = loadConfig();
     console.log(`Configuration OK: ${config.destinations.map(({ type }) => type).join(", ")}`);
-    console.log(`Presence suppression: ${config.presence?.enabled ? "enabled" : "disabled"}`);
+    console.log(`Presence suppression: ${presenceSuppressionEnabled(config) ? "enabled" : "disabled"}`);
     return 0;
   } catch (error) {
     console.error(`codex-notify: ${(error as Error).message}`);
