@@ -7,10 +7,10 @@ The notification is deliberately generic. Prompt text, assistant responses, file
 ## Requirements
 
 - Codex with the `notify` hook
-- Python 3.9 or later
+- [Bun 1.4.0](https://bun.sh/docs/installation) or later to install, build, and test
 - Linux or macOS
 
-The script uses only the Python standard library. KDE Wayland presence detection additionally uses the system `dbus` and PyGObject modules.
+The installer compiles the TypeScript application into one native executable. Bun is not required when Codex runs the installed hook.
 
 ## Install
 
@@ -22,18 +22,15 @@ Run the portable installer:
 
 It installs into `~/.local/bin`, creates a private example configuration if one does not exist, and prints the `notify` line to add to Codex. It never changes `~/.codex/config.toml` automatically.
 
-To install manually, copy the two runtime files:
+To build and install manually:
 
 ```sh
-install -Dm700 codex_notify.py "$HOME/.local/bin/codex-notify"
-install -Dm600 codex-notify-active-window.js "$HOME/.local/bin/codex-notify-active-window.js"
-```
-
-On macOS, the BSD `install` command does not support `-D`:
-
-```sh
+git clone https://github.com/astrovm/codex-notify.git
+cd codex-notify
+bun install --frozen-lockfile
+bun run build
 mkdir -p "$HOME/.local/bin"
-install -m700 codex_notify.py "$HOME/.local/bin/codex-notify"
+install -m700 dist/codex-notify "$HOME/.local/bin/codex-notify"
 install -m600 codex-notify-active-window.js "$HOME/.local/bin/codex-notify-active-window.js"
 ```
 
@@ -68,6 +65,12 @@ Then send one generic test message to every configured destination:
 
 ```sh
 codex-notify --test
+```
+
+Check platform integration without reading notification secrets or sending anything:
+
+```sh
+codex-notify --diagnose
 ```
 
 ### ntfy
@@ -111,7 +114,7 @@ You can include both destination objects to send through ntfy and Telegram.
 
 Codex can invoke a notification hook more than once for the same event. This project creates an atomic marker for each `(thread-id, turn-id, destination)` tuple. Concurrent callbacks therefore send only once to each configured destination.
 
-When `~/.codex/thread_history_1.sqlite` exists, the notifier also waits until that exact turn has a terminal status. Current macOS desktop builds do not create that database, so macOS uses the completed hook event itself and the same per-turn deduplication.
+When `~/.codex/thread_history_1.sqlite` exists, the notifier also waits until that exact turn has a terminal status. If a current Codex installation has not created the database yet, the notifier uses the completed hook event itself and the same per-turn deduplication.
 
 Persistent marker files contain hashed event and destination identifiers plus delivery outcomes. A temporary private worker request contains the Codex thread ID, turn ID, and terminal status; it is deleted after successful delivery or presence suppression. State files never contain prompts, responses, destination URLs, bot tokens, or chat IDs.
 
@@ -142,7 +145,10 @@ On Linux, input activity uses read-only access to `/dev/input/event*`; active-wi
 ## Test
 
 ```sh
-python3 -m unittest discover -s tests -v
+bun install --frozen-lockfile
+bun run typecheck
+bun test
+bun run build
 ```
 
 ## Privacy and security

@@ -4,8 +4,15 @@ set -eu
 source_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 binary_directory=${HOME}/.local/bin
 
+if ! command -v bun >/dev/null 2>&1; then
+    printf 'Bun 1.4.0 or later is required. See https://bun.sh/docs/installation\n' >&2
+    exit 1
+fi
+
 mkdir -p "$binary_directory"
-install -m 700 "$source_directory/codex_notify.py" "$binary_directory/codex-notify"
+bun install --frozen-lockfile --cwd "$source_directory"
+bun build "$source_directory/src/codex-notify.ts" --compile --outfile "$binary_directory/codex-notify"
+chmod 700 "$binary_directory/codex-notify"
 install -m 600 "$source_directory/codex-notify-active-window.js" "$binary_directory/codex-notify-active-window.js"
 
 if [ "$(uname -s)" = "Darwin" ]; then
