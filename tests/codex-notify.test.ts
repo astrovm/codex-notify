@@ -13,12 +13,14 @@ import { tmpdir } from "node:os";
 import {
   ConfigError,
   destinationDigest,
+  hasNewerLegacyTurn,
   hasNewerTurn,
   isActivityEvent,
   linuxActivityAfterCompletion,
   loadConfig,
   notificationText,
   processTurn,
+  readLegacyTurnState,
   readTurnStatus,
   sessionBusAddress,
   sendDestination,
@@ -35,6 +37,38 @@ function temporaryDirectory(): string {
   const path = join(tmpdir(), `codex-notify-test-${crypto.randomUUID()}`);
   mkdirSync(path, { mode: 0o700 });
   temporaryDirectories.push(path);
+  return path;
+}
+
+function writeLegacySession(
+  root: string,
+  threadId: string,
+  events: Array<Record<string, unknown>>,
+  options: {
+    source?: unknown;
+    historyMode?: string;
+    threadSource?: unknown;
+  } = {},
+): string {
+  const directory = join(root, "2026", "08", "27");
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const path = join(directory, `rollout-synthetic-${threadId}.jsonl`);
+  const metadata: Record<string, unknown> = {
+    id: threadId,
+    history_mode: options.historyMode ?? "legacy",
+    source: options.source ?? "vscode",
+  };
+  if ("threadSource" in options) metadata.thread_source = options.threadSource;
+  writeFileSync(
+    path,
+    [
+      { type: "session_meta", payload: metadata },
+      ...events.map((payload) => ({ type: "event_msg", payload })),
+    ]
+      .map((record) => JSON.stringify(record))
+      .join("\n") + "\n",
+    { mode: 0o600 },
+  );
   return path;
 }
 
@@ -88,6 +122,80 @@ describe("configuration", () => {
 });
 
 describe("completion and deduplication", () => {
+  test("reads only an exact persisted legacy completion", () => {
+    const sessions = temporaryDirectory();
+    const threadId = "legacy-thread";
+    const turnId = "legacy-turn";
+    const path = writeLegacySession(sessions, threadId, [
+      { type: "task_started", turn_id: turnId },
+      { type: "task_complete", turn_id: "different-turn" },
+    ]);
+    expect(readLegacyTurnState(threadId, turnId, sessions)).toBe("pending");
+    writeFileSync(
+      path,
+      `${readFileSync(path, "utf8")}${JSON.stringify({
+        type: "event_msg",
+        payload: { type: "task_complete", turn_id: turnId },
+      })}\n`,
+      { mode: 0o600 },
+    );
+    expect(readLegacyTurnState(threadId, turnId, sessions)).toBe("completed");
+  });
+
+  test("maps an exact persisted legacy interruption", () => {
+    const sessions = temporaryDirectory();
+    writeLegacySession(sessions, "legacy-thread", [
+      { type: "task_started", turn_id: "legacy-turn" },
+      {
+        type: "turn_aborted",
+        turn_id: "legacy-turn",
+        reason: "interrupted",
+      },
+    ]);
+    expect(readLegacyTurnState("legacy-thread", "legacy-turn", sessions)).toBe(
+      "interrupted",
+    );
+  });
+
+  test("rejects internal and paginated rollout sessions", () => {
+    const sessions = temporaryDirectory();
+    writeLegacySession(
+      sessions,
+      "guardian-thread",
+      [
+        { type: "task_started", turn_id: "guardian-turn" },
+        { type: "task_complete", turn_id: "guardian-turn" },
+      ],
+      { source: { subagent: { other: "guardian" } } },
+    );
+    writeLegacySession(
+      sessions,
+      "paginated-thread",
+      [
+        { type: "task_started", turn_id: "paginated-turn" },
+        { type: "task_complete", turn_id: "paginated-turn" },
+      ],
+      { historyMode: "paginated" },
+    );
+    expect(
+      readLegacyTurnState("guardian-thread", "guardian-turn", sessions),
+    ).toBe("untracked");
+    expect(
+      readLegacyTurnState("paginated-thread", "paginated-turn", sessions),
+    ).toBe("untracked");
+  });
+
+  test("detects a newer turn in the same legacy session", () => {
+    const sessions = temporaryDirectory();
+    writeLegacySession(sessions, "legacy-thread", [
+      { type: "task_started", turn_id: "turn-1" },
+      { type: "task_complete", turn_id: "turn-1" },
+      { type: "task_started", turn_id: "turn-2" },
+    ]);
+    expect(hasNewerLegacyTurn("legacy-thread", "turn-1", sessions)).toBe(true);
+    expect(hasNewerLegacyTurn("legacy-thread", "turn-2", sessions)).toBe(false);
+  });
+
   test("reads the exact completed turn", () => {
     const path = join(temporaryDirectory(), "history.sqlite");
     const database = new Database(path);
@@ -199,6 +307,151 @@ describe("completion and deduplication", () => {
     expect(statusReader).toHaveBeenCalledTimes(3);
     expect(sleep).toHaveBeenCalledTimes(2);
     expect(sender).not.toHaveBeenCalled();
+  });
+
+  test("waits for persisted legacy completion when SQLite has no row", async () => {
+    const state = temporaryDirectory();
+    const sessions = temporaryDirectory();
+    const historyPath = join(state, "history.sqlite");
+    writeFileSync(historyPath, "synthetic", { mode: 0o600 });
+    const threadId = "legacy-wait-thread";
+    const turnId = "legacy-wait-turn";
+    const path = writeLegacySession(sessions, threadId, [
+      { type: "task_started", turn_id: turnId },
+    ]);
+    let currentTime = 0;
+    const sender = mock(async () => true);
+    const sleep = mock(async (milliseconds: number) => {
+      currentTime += milliseconds;
+      writeFileSync(
+        path,
+        `${readFileSync(path, "utf8")}${JSON.stringify({
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: turnId },
+        })}\n`,
+        { mode: 0o600 },
+      );
+    });
+    expect(
+      await processTurn(
+        { destinations: [ntfy], presence: { enabled: false } },
+        threadId,
+        turnId,
+        "failed",
+        {
+          state,
+          historyPath,
+          sessionsPath: sessions,
+          statusReader: () => null,
+          sleep,
+          now: () => currentTime,
+          maximumWaitMilliseconds: 500,
+          sender,
+        },
+      ),
+    ).toBe("sent");
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sender).toHaveBeenCalledWith(ntfy, "completed");
+  });
+
+  test("rejects a premature internal hook and sends the real legacy completion", async () => {
+    const state = temporaryDirectory();
+    const sessions = temporaryDirectory();
+    const historyPath = join(state, "history.sqlite");
+    writeFileSync(historyPath, "synthetic", { mode: 0o600 });
+    writeLegacySession(
+      sessions,
+      "internal-thread",
+      [
+        { type: "task_started", turn_id: "internal-turn" },
+        { type: "task_complete", turn_id: "internal-turn" },
+      ],
+      { source: { subagent: { other: "title_generation" } } },
+    );
+    writeLegacySession(sessions, "visible-thread", [
+      { type: "task_started", turn_id: "visible-turn" },
+      { type: "task_complete", turn_id: "visible-turn" },
+    ]);
+    let currentTime = 0;
+    const sender = mock(async () => true);
+    const options = {
+      state,
+      historyPath,
+      sessionsPath: sessions,
+      statusReader: () => null,
+      sleep: async (milliseconds: number) => {
+        currentTime += milliseconds;
+      },
+      now: () => currentTime,
+      rowDiscoveryWaitMilliseconds: 250,
+      maximumWaitMilliseconds: 500,
+      sender,
+    };
+    expect(
+      await processTurn(
+        { destinations: [ntfy], presence: { enabled: false } },
+        "internal-thread",
+        "internal-turn",
+        "completed",
+        options,
+      ),
+    ).toBe("untracked");
+    expect(
+      await processTurn(
+        { destinations: [ntfy], presence: { enabled: false } },
+        "visible-thread",
+        "visible-turn",
+        "completed",
+        options,
+      ),
+    ).toBe("sent");
+    expect(sender).toHaveBeenCalledTimes(1);
+  });
+
+  test("serializes concurrent deliveries for one legacy turn", async () => {
+    const state = temporaryDirectory();
+    const sessions = temporaryDirectory();
+    const historyPath = join(state, "history.sqlite");
+    writeFileSync(historyPath, "synthetic", { mode: 0o600 });
+    writeLegacySession(sessions, "legacy-thread", [
+      { type: "task_started", turn_id: "legacy-turn" },
+      { type: "task_complete", turn_id: "legacy-turn" },
+    ]);
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const sender = mock(async () => {
+      await blocked;
+      return true;
+    });
+    const options = {
+      state,
+      historyPath,
+      sessionsPath: sessions,
+      statusReader: () => null,
+      sender,
+    };
+    const first = processTurn(
+      { destinations: [ntfy], presence: { enabled: false } },
+      "legacy-thread",
+      "legacy-turn",
+      "completed",
+      options,
+    );
+    await Bun.sleep(0);
+    expect(
+      await processTurn(
+        { destinations: [ntfy], presence: { enabled: false } },
+        "legacy-thread",
+        "legacy-turn",
+        "completed",
+        options,
+      ),
+    ).toBe("worker-active");
+    release();
+    expect(await first).toBe("sent");
+    expect(sender).toHaveBeenCalledTimes(1);
   });
 
   test("keeps waiting when SQLite tracks a nonterminal turn", async () => {
