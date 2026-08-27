@@ -23,6 +23,7 @@ import { dirname, join } from "node:path";
 import { homedir, platform } from "node:os";
 
 export const POLL_MILLISECONDS = 250;
+export const ROW_DISCOVERY_WAIT_MILLISECONDS = 2_000;
 export const MAX_WAIT_MILLISECONDS = 24 * 60 * 60 * 1_000;
 export const TERMINAL_TURN_STATUSES = new Set([
   "completed",
@@ -109,6 +110,7 @@ export interface ProcessTurnOptions {
   ) => Promise<boolean | DeliveryResult>;
   sleep?: (milliseconds: number) => Promise<void>;
   now?: () => number;
+  rowDiscoveryWaitMilliseconds?: number;
   maximumWaitMilliseconds?: number;
   state?: string;
   historyPath?: string;
@@ -933,19 +935,35 @@ async function waitForTerminalStatus(
   options: Required<
     Pick<
       ProcessTurnOptions,
-      "statusReader" | "sleep" | "now" | "maximumWaitMilliseconds"
+      | "statusReader"
+      | "sleep"
+      | "now"
+      | "rowDiscoveryWaitMilliseconds"
+      | "maximumWaitMilliseconds"
     >
   > & {
     historyPath: string;
   },
 ): Promise<TerminalStatus | null> {
   if (!existsSync(options.historyPath)) return fallbackStatus;
-  const deadline = options.now() + options.maximumWaitMilliseconds;
+  const startedAt = options.now();
+  const discoveryDeadline =
+    startedAt +
+    Math.min(
+      options.rowDiscoveryWaitMilliseconds,
+      options.maximumWaitMilliseconds,
+    );
+  const deadline = startedAt + options.maximumWaitMilliseconds;
   let turn = options.statusReader(threadId, turnId);
-  while (!turn || !TERMINAL_TURN_STATUSES.has(turn.status)) {
-    if (options.now() >= deadline) return null;
+  while (!turn) {
+    if (options.now() >= discoveryDeadline) return fallbackStatus;
     await options.sleep(POLL_MILLISECONDS);
     turn = options.statusReader(threadId, turnId);
+  }
+  while (!TERMINAL_TURN_STATUSES.has(turn.status)) {
+    if (options.now() >= deadline) return null;
+    await options.sleep(POLL_MILLISECONDS);
+    turn = options.statusReader(threadId, turnId) ?? turn;
   }
   return turn.status as TerminalStatus;
 }
@@ -999,6 +1017,9 @@ export async function processTurn(
           ((thread, turn) => readTurnStatus(thread, turn, historyPath)),
         sleep: supplied.sleep ?? Bun.sleep,
         now: supplied.now ?? Date.now,
+        rowDiscoveryWaitMilliseconds:
+          supplied.rowDiscoveryWaitMilliseconds ??
+          ROW_DISCOVERY_WAIT_MILLISECONDS,
         maximumWaitMilliseconds,
       },
     );
