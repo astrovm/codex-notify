@@ -39,6 +39,7 @@ const EV_REL = 0x02;
 const EV_ABS = 0x03;
 
 export type TerminalStatus = "completed" | "failed" | "interrupted";
+export type LegacyTurnState = TerminalStatus | "pending" | "untracked";
 
 export type DeliveryFailurePhase =
   "dns" | "connect" | "tls" | "timeout" | "http" | "response" | "unknown";
@@ -103,6 +104,7 @@ export interface WorkerRequest {
 
 export interface ProcessTurnOptions {
   statusReader?: (threadId: string, turnId: string) => TurnStatus | null;
+  legacyStatusReader?: (threadId: string, turnId: string) => LegacyTurnState;
   newerTurnChecker?: (threadId: string, turnId: string) => boolean;
   acknowledgementChecker?: (graceSeconds: number) => Promise<boolean>;
   sender?: (
@@ -115,6 +117,7 @@ export interface ProcessTurnOptions {
   maximumWaitMilliseconds?: number;
   state?: string;
   historyPath?: string;
+  sessionsPath?: string;
 }
 
 export class ConfigError extends Error {}
@@ -164,6 +167,12 @@ export function historyDatabase(): string {
   return (
     envPath("CODEX_NOTIFY_HISTORY_DATABASE") ??
     join(codexHome(), "thread_history_1.sqlite")
+  );
+}
+
+export function sessionsDirectory(): string {
+  return (
+    envPath("CODEX_NOTIFY_SESSIONS_DIRECTORY") ?? join(codexHome(), "sessions")
   );
 }
 
@@ -329,6 +338,151 @@ export function hasNewerTurn(
   } finally {
     database?.close();
   }
+}
+
+interface LegacySessionInspection {
+  eligible: boolean;
+  started: boolean;
+  status: TerminalStatus | null;
+  unsupportedTerminal: boolean;
+  newerTurn: boolean;
+}
+
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function legacySessionFiles(root: string, threadId: string): string[] {
+  if (!threadId || !existsSync(root)) return [];
+  const pending = [root];
+  const files: string[] = [];
+  while (pending.length > 0) {
+    const directory = pending.pop()!;
+    try {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const path = join(directory, entry.name);
+        if (entry.isDirectory()) {
+          pending.push(path);
+        } else if (
+          entry.isFile() &&
+          entry.name.startsWith("rollout-") &&
+          entry.name.endsWith(".jsonl") &&
+          entry.name.includes(threadId)
+        ) {
+          files.push(path);
+        }
+      }
+    } catch {
+      // An unreadable session directory cannot establish completion.
+    }
+  }
+  return files;
+}
+
+function inspectLegacySession(
+  path: string,
+  threadId: string,
+  turnId: string,
+): LegacySessionInspection {
+  let eligible = false;
+  let started = false;
+  let currentStarted = false;
+  let newerTurn = false;
+  let status: TerminalStatus | null = null;
+  let unsupportedTerminal = false;
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return {
+      eligible,
+      started,
+      status,
+      unsupportedTerminal,
+      newerTurn,
+    };
+  }
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    let record: Record<string, unknown> | null;
+    try {
+      record = objectValue(JSON.parse(line));
+    } catch {
+      continue;
+    }
+    if (!record) continue;
+    const payload = objectValue(record.payload);
+    if (!payload) continue;
+    if (record.type === "session_meta") {
+      const source = payload.source;
+      const threadSource = payload.thread_source;
+      eligible =
+        payload.id === threadId &&
+        payload.history_mode === "legacy" &&
+        (source === "vscode" || source === "cli") &&
+        (threadSource === undefined ||
+          threadSource === null ||
+          threadSource === "user" ||
+          threadSource === "realtime_voice");
+      continue;
+    }
+    if (record.type !== "event_msg") continue;
+    if (payload.type === "task_started") {
+      if (payload.turn_id === turnId) {
+        started = true;
+        currentStarted = true;
+      } else if (currentStarted) {
+        newerTurn = true;
+      }
+      continue;
+    }
+    if (payload.turn_id !== turnId) continue;
+    if (payload.type === "task_complete") {
+      status = "completed";
+    } else if (payload.type === "turn_aborted") {
+      if (payload.reason === "interrupted") status = "interrupted";
+      else unsupportedTerminal = true;
+    }
+  }
+  return {
+    eligible,
+    started,
+    status,
+    unsupportedTerminal,
+    newerTurn,
+  };
+}
+
+export function readLegacyTurnState(
+  threadId: string,
+  turnId: string,
+  root = sessionsDirectory(),
+): LegacyTurnState {
+  const statuses = new Set<TerminalStatus>();
+  let pending = false;
+  for (const path of legacySessionFiles(root, threadId)) {
+    const session = inspectLegacySession(path, threadId, turnId);
+    if (!session.eligible || !session.started) continue;
+    if (session.unsupportedTerminal) return "untracked";
+    if (session.status) statuses.add(session.status);
+    else pending = true;
+  }
+  if (statuses.size === 1) return statuses.values().next().value!;
+  if (statuses.size > 1) return "untracked";
+  return pending ? "pending" : "untracked";
+}
+
+export function hasNewerLegacyTurn(
+  threadId: string,
+  turnId: string,
+  root = sessionsDirectory(),
+): boolean {
+  return legacySessionFiles(root, threadId).some((path) => {
+    const session = inspectLegacySession(path, threadId, turnId);
+    return session.eligible && session.started && session.newerTurn;
+  });
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -977,6 +1131,7 @@ async function waitForTerminalStatus(
     Pick<
       ProcessTurnOptions,
       | "statusReader"
+      | "legacyStatusReader"
       | "sleep"
       | "now"
       | "rowDiscoveryWaitMilliseconds"
@@ -996,17 +1151,20 @@ async function waitForTerminalStatus(
     );
   const deadline = startedAt + options.maximumWaitMilliseconds;
   let turn = options.statusReader(threadId, turnId);
-  while (!turn) {
-    if (options.now() >= discoveryDeadline) return "untracked";
-    await options.sleep(POLL_MILLISECONDS);
-    turn = options.statusReader(threadId, turnId);
-  }
-  while (!TERMINAL_TURN_STATUSES.has(turn.status)) {
+  while (true) {
+    if (turn && TERMINAL_TURN_STATUSES.has(turn.status)) {
+      return turn.status as TerminalStatus;
+    }
+    const legacy = turn
+      ? "untracked"
+      : options.legacyStatusReader(threadId, turnId);
+    if (legacy === "completed" || legacy === "interrupted") return legacy;
     if (options.now() >= deadline) return null;
+    if (!turn && legacy === "untracked" && options.now() >= discoveryDeadline)
+      return "untracked";
     await options.sleep(POLL_MILLISECONDS);
     turn = options.statusReader(threadId, turnId) ?? turn;
   }
-  return turn.status as TerminalStatus;
 }
 
 function acquireTurnLock(
@@ -1047,6 +1205,7 @@ export async function processTurn(
   try {
     if (existsSync(skippedMarker)) return "duplicate";
     const historyPath = supplied.historyPath ?? historyDatabase();
+    const sessionsPath = supplied.sessionsPath ?? sessionsDirectory();
     const status = await waitForTerminalStatus(
       threadId,
       turnId,
@@ -1056,6 +1215,9 @@ export async function processTurn(
         statusReader:
           supplied.statusReader ??
           ((thread, turn) => readTurnStatus(thread, turn, historyPath)),
+        legacyStatusReader:
+          supplied.legacyStatusReader ??
+          ((thread, turn) => readLegacyTurnState(thread, turn, sessionsPath)),
         sleep: supplied.sleep ?? Bun.sleep,
         now: supplied.now ?? Date.now,
         rowDiscoveryWaitMilliseconds:
@@ -1076,7 +1238,9 @@ export async function processTurn(
       }
       const newerTurn =
         supplied.newerTurnChecker ??
-        ((thread, turn) => hasNewerTurn(thread, turn, historyPath));
+        ((thread, turn) =>
+          hasNewerTurn(thread, turn, historyPath) ||
+          hasNewerLegacyTurn(thread, turn, sessionsPath));
       if (newerTurn(threadId, turnId)) {
         writeMarker(skippedMarker, "superseded");
         return "superseded";
