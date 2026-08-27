@@ -118,9 +118,9 @@ The hook writes one private request and starts a detached per-turn worker. The h
 
 Codex can invoke a notification hook more than once for the same event. This project creates an atomic marker for each `(thread-id, turn-id, destination)` tuple. Concurrent callbacks therefore send only once to each configured destination.
 
-When `~/.codex/thread_history_1.sqlite` tracks the exact turn, the worker waits until that row has a terminal status. Some Codex clients do not record their turns in this database. If the exact row does not appear within two seconds, or the database does not exist, the worker uses the completed hook event itself. The same per-turn deduplication applies to both paths.
+When `~/.codex/thread_history_1.sqlite` exists, the worker waits for the exact turn row and requires it to reach a terminal status. If the row does not appear within two seconds, the worker treats the hook event as untracked and does not notify. This prevents internal hook events from producing premature notifications. The completed hook event is used only when the database does not exist. The same per-turn deduplication applies to both delivery paths.
 
-Persistent marker files contain hashed event and destination identifiers plus delivery outcomes. A temporary private worker request contains the Codex thread ID, turn ID, and terminal status; it is deleted after successful delivery or presence suppression.
+Persistent marker files contain hashed event and destination identifiers plus delivery outcomes. A temporary private worker request contains the Codex thread ID, turn ID, and terminal status; it is deleted after successful delivery, presence suppression, or classification as an untracked hook event.
 
 Private `0600` diagnostic files record only safe fields: worker outcome, destination type, attempt count, delivery phase, error code or name, and HTTP status. State and diagnostic files never contain prompts, responses, destination URLs, topics, bot tokens, chat IDs, or HTTP response bodies.
 

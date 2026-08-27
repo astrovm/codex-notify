@@ -985,7 +985,7 @@ async function waitForTerminalStatus(
   > & {
     historyPath: string;
   },
-): Promise<TerminalStatus | null> {
+): Promise<TerminalStatus | "untracked" | null> {
   if (!existsSync(options.historyPath)) return fallbackStatus;
   const startedAt = options.now();
   const discoveryDeadline =
@@ -997,7 +997,7 @@ async function waitForTerminalStatus(
   const deadline = startedAt + options.maximumWaitMilliseconds;
   let turn = options.statusReader(threadId, turnId);
   while (!turn) {
-    if (options.now() >= discoveryDeadline) return fallbackStatus;
+    if (options.now() >= discoveryDeadline) return "untracked";
     await options.sleep(POLL_MILLISECONDS);
     turn = options.statusReader(threadId, turnId);
   }
@@ -1064,6 +1064,7 @@ export async function processTurn(
         maximumWaitMilliseconds,
       },
     );
+    if (status === "untracked") return "untracked";
     if (!status) return "timeout";
     if (presenceSuppressionEnabled(config)) {
       const grace = config.presence?.grace_seconds ?? 8;
@@ -1337,7 +1338,13 @@ export async function main(args = commandLineArguments()): Promise<number> {
     );
     tryWriteWorkerDiagnostic(digest, outcome);
     if (
-      ["sent", "skipped-present", "superseded", "duplicate"].includes(outcome)
+      [
+        "sent",
+        "skipped-present",
+        "superseded",
+        "untracked",
+        "duplicate",
+      ].includes(outcome)
     ) {
       try {
         unlinkSync(loaded.path);

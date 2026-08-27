@@ -169,7 +169,7 @@ describe("completion and deduplication", () => {
     expect(sender).toHaveBeenCalledWith(ntfy, "completed");
   });
 
-  test("uses the hook status when SQLite does not track the turn", async () => {
+  test("ignores a hook event that SQLite does not track", async () => {
     const state = temporaryDirectory();
     const historyPath = join(state, "history.sqlite");
     writeFileSync(historyPath, "synthetic", { mode: 0o600 });
@@ -195,10 +195,10 @@ describe("completion and deduplication", () => {
           sender,
         },
       ),
-    ).toBe("sent");
+    ).toBe("untracked");
     expect(statusReader).toHaveBeenCalledTimes(3);
     expect(sleep).toHaveBeenCalledTimes(2);
-    expect(sender).toHaveBeenCalledWith(ntfy, "completed");
+    expect(sender).not.toHaveBeenCalled();
   });
 
   test("keeps waiting when SQLite tracks a nonterminal turn", async () => {
