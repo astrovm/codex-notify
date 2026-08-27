@@ -13,7 +13,9 @@ import { tmpdir } from "node:os";
 import {
   ConfigError,
   destinationDigest,
+  hasNewerTurn,
   isActivityEvent,
+  linuxActivityAfterCompletion,
   loadConfig,
   notificationText,
   processTurn,
@@ -103,6 +105,33 @@ describe("completion and deduplication", () => {
       status: "completed",
       completedAt: 123,
     });
+  });
+
+  test("detects a newer turn in the same SQLite thread", () => {
+    const path = join(temporaryDirectory(), "history.sqlite");
+    const database = new Database(path);
+    database.run(
+      "CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT, rollout_ordinal INTEGER)",
+    );
+    database.run("INSERT INTO thread_turns VALUES (?, ?, ?)", [
+      "thread-1",
+      "turn-1",
+      1,
+    ]);
+    database.run("INSERT INTO thread_turns VALUES (?, ?, ?)", [
+      "thread-1",
+      "turn-2",
+      2,
+    ]);
+    database.run("INSERT INTO thread_turns VALUES (?, ?, ?)", [
+      "thread-2",
+      "turn-3",
+      3,
+    ]);
+    database.close();
+    expect(hasNewerTurn("thread-1", "turn-1", path)).toBe(true);
+    expect(hasNewerTurn("thread-1", "turn-2", path)).toBe(false);
+    expect(hasNewerTurn("thread-2", "turn-3", path)).toBe(false);
   });
 
   test("waits for the exact turn to become terminal before sending", async () => {
@@ -375,6 +404,47 @@ describe("completion and deduplication", () => {
     expect(sender).toHaveBeenCalledTimes(1);
   });
 
+  test("suppresses a completed turn when the same thread continues", async () => {
+    const state = temporaryDirectory();
+    const sender = mock(async () => true);
+    const acknowledgementChecker = mock(async () => false);
+    const newerTurnChecker = mock(() => true);
+    const config: NotifyConfig = {
+      destinations: [ntfy],
+      presence: { enabled: true, grace_seconds: 8 },
+    };
+    const options = {
+      state,
+      historyPath: join(state, "missing"),
+      sender,
+      acknowledgementChecker,
+      newerTurnChecker,
+    };
+    expect(
+      await processTurn(
+        config,
+        "thread-continued",
+        "turn-previous",
+        "completed",
+        options,
+      ),
+    ).toBe("superseded");
+    expect(newerTurnChecker).toHaveBeenCalledWith(
+      "thread-continued",
+      "turn-previous",
+    );
+    expect(sender).not.toHaveBeenCalled();
+    expect(
+      await processTurn(
+        config,
+        "thread-continued",
+        "turn-previous",
+        "completed",
+        options,
+      ),
+    ).toBe("duplicate");
+  });
+
   test("checks presence again before retrying a failed delivery", async () => {
     const state = temporaryDirectory();
     const acknowledgements = [false, true];
@@ -593,6 +663,24 @@ describe("private diagnostics", () => {
 });
 
 describe("presence primitives", () => {
+  test("waits for the full Linux grace when input is unavailable", async () => {
+    const inputDirectory = temporaryDirectory();
+    let currentTime = 0;
+    const sleep = mock(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
+    expect(
+      await linuxActivityAfterCompletion(
+        8,
+        inputDirectory,
+        sleep,
+        () => currentTime,
+      ),
+    ).toBe(false);
+    expect(currentTime).toBe(8_000);
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
   test("uses the configured session bus address", () => {
     expect(
       sessionBusAddress(

@@ -132,6 +132,8 @@ Presence suppression is enabled by default. It skips remote notifications only w
 2. The session is unlocked.
 3. Codex or ChatGPT is the active application.
 
+The worker always observes the full grace period when input activity is unavailable. After the grace period, it also suppresses an older completed turn when SQLite shows that a newer turn has started in the same thread. The newer turn can then notify when it finishes.
+
 ```json
 {
   "destinations": [

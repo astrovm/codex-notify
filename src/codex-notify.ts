@@ -103,6 +103,7 @@ export interface WorkerRequest {
 
 export interface ProcessTurnOptions {
   statusReader?: (threadId: string, turnId: string) => TurnStatus | null;
+  newerTurnChecker?: (threadId: string, turnId: string) => boolean;
   acknowledgementChecker?: (graceSeconds: number) => Promise<boolean>;
   sender?: (
     destination: Destination,
@@ -301,6 +302,35 @@ export function readTurnStatus(
   }
 }
 
+export function hasNewerTurn(
+  threadId: string,
+  turnId: string,
+  databasePath = historyDatabase(),
+): boolean {
+  if (!existsSync(databasePath)) return false;
+  let database: Database | undefined;
+  try {
+    database = new Database(databasePath, { readonly: true, strict: true });
+    const row = database
+      .query(
+        `SELECT EXISTS (
+          SELECT 1
+          FROM thread_turns AS current
+          JOIN thread_turns AS newer
+            ON newer.thread_id = current.thread_id
+           AND newer.rollout_ordinal > current.rollout_ordinal
+          WHERE current.thread_id = ? AND current.turn_id = ?
+        ) AS found`,
+      )
+      .get(threadId, turnId) as { found: unknown } | null;
+    return Number(row?.found) === 1;
+  } catch {
+    return false;
+  } finally {
+    database?.close();
+  }
+}
+
 function errorCode(error: unknown): string | undefined {
   if (!error || typeof error !== "object") return undefined;
   const direct = (error as NodeJS.ErrnoException).code;
@@ -476,22 +506,31 @@ export function isActivityEvent(eventType: number, value: number): boolean {
 
 export async function linuxActivityAfterCompletion(
   timeoutSeconds: number,
+  inputDirectory = "/dev/input",
+  sleep: (milliseconds: number) => Promise<void> = Bun.sleep,
+  now: () => number = Date.now,
 ): Promise<boolean> {
   const descriptors: number[] = [];
+  const deadline = now() + Math.max(0, timeoutSeconds) * 1_000;
+  const waitForDeadline = async (): Promise<void> => {
+    const remaining = deadline - now();
+    if (remaining > 0) await sleep(remaining);
+  };
   try {
     let names: string[];
     try {
-      names = readdirSync("/dev/input").filter((name) =>
+      names = readdirSync(inputDirectory).filter((name) =>
         name.startsWith("event"),
       );
     } catch {
+      await waitForDeadline();
       return false;
     }
     for (const name of names) {
       try {
         descriptors.push(
           openSync(
-            join("/dev/input", name),
+            join(inputDirectory, name),
             constants.O_RDONLY | constants.O_NONBLOCK,
           ),
         );
@@ -499,10 +538,12 @@ export async function linuxActivityAfterCompletion(
         // A missing or unreadable input device makes this probe less complete, not fatal.
       }
     }
-    if (descriptors.length === 0) return false;
+    if (descriptors.length === 0) {
+      await waitForDeadline();
+      return false;
+    }
     const buffer = Buffer.alloc(INPUT_EVENT_SIZE * 64);
-    const deadline = Date.now() + Math.max(0, timeoutSeconds) * 1_000;
-    while (Date.now() < deadline) {
+    while (now() < deadline) {
       for (const descriptor of descriptors) {
         try {
           const length = readSync(descriptor, buffer, 0, buffer.length, null);
@@ -519,7 +560,7 @@ export async function linuxActivityAfterCompletion(
           if (code !== "EAGAIN" && code !== "EWOULDBLOCK") continue;
         }
       }
-      await Bun.sleep(50);
+      await sleep(Math.min(50, Math.max(0, deadline - now())));
     }
     return false;
   } finally {
@@ -1032,6 +1073,13 @@ export async function processTurn(
         writeMarker(skippedMarker, "present");
         return "skipped-present";
       }
+      const newerTurn =
+        supplied.newerTurnChecker ??
+        ((thread, turn) => hasNewerTurn(thread, turn, historyPath));
+      if (newerTurn(threadId, turnId)) {
+        writeMarker(skippedMarker, "superseded");
+        return "superseded";
+      }
     }
     const sender = supplied.sender ?? sendDestination;
     const pending: Array<[Destination, string]> = [];
@@ -1288,7 +1336,9 @@ export async function main(args = commandLineArguments()): Promise<number> {
       loaded.request.status,
     );
     tryWriteWorkerDiagnostic(digest, outcome);
-    if (["sent", "skipped-present", "duplicate"].includes(outcome)) {
+    if (
+      ["sent", "skipped-present", "superseded", "duplicate"].includes(outcome)
+    ) {
       try {
         unlinkSync(loaded.path);
       } catch {
