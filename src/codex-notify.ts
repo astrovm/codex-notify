@@ -4,6 +4,7 @@ import { Database } from "bun:sqlite";
 import { dlopen, FFIType } from "bun:ffi";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   closeSync,
   constants,
   existsSync,
@@ -23,6 +24,8 @@ import { homedir, platform } from "node:os";
 
 export const POLL_MILLISECONDS = 250;
 export const MAX_WAIT_MILLISECONDS = 24 * 60 * 60 * 1_000;
+export const SERVICE_POLL_MILLISECONDS = 1_000;
+export const SERVICE_RETRY_MILLISECONDS = 30_000;
 export const TERMINAL_TURN_STATUSES = new Set([
   "completed",
   "failed",
@@ -37,6 +40,31 @@ const EV_REL = 0x02;
 const EV_ABS = 0x03;
 
 export type TerminalStatus = "completed" | "failed" | "interrupted";
+
+export type DeliveryFailurePhase =
+  "dns" | "connect" | "tls" | "timeout" | "http" | "response" | "unknown";
+
+export type DeliveryResult =
+  | { ok: true; httpStatus: number }
+  | {
+      ok: false;
+      phase: DeliveryFailurePhase;
+      errorCode?: string;
+      errorName?: string;
+      httpStatus?: number;
+    };
+
+export interface DeliveryDiagnostic {
+  version: 1;
+  timestamp: number;
+  destinationType: Destination["type"];
+  outcome: "sent" | "failed";
+  attempt: number;
+  phase?: DeliveryFailurePhase;
+  errorCode?: string;
+  errorName?: string;
+  httpStatus?: number;
+}
 
 export interface NtfyDestination {
   type: "ntfy";
@@ -80,7 +108,7 @@ export interface ProcessTurnOptions {
   sender?: (
     destination: Destination,
     status: TerminalStatus,
-  ) => Promise<boolean>;
+  ) => Promise<boolean | DeliveryResult>;
   sleep?: (milliseconds: number) => Promise<void>;
   now?: () => number;
   maximumWaitMilliseconds?: number;
@@ -129,6 +157,11 @@ export function stateDirectory(): string {
   }
   const root = envPath("XDG_STATE_HOME") ?? join(homedir(), ".local", "state");
   return join(root, "codex-notify");
+}
+
+function ensurePrivateDirectory(path: string): void {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  chmodSync(path, 0o700);
 }
 
 export function historyDatabase(): string {
@@ -237,6 +270,124 @@ export function destinationDigest(destination: Destination): string {
     Object.entries(destination).sort(([a], [b]) => a.localeCompare(b)),
   );
   return hash(sorted).slice(0, 16);
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const direct = (error as NodeJS.ErrnoException).code;
+  if (typeof direct === "string" && direct) return direct;
+  const cause = (error as { cause?: unknown }).cause;
+  if (!cause || typeof cause !== "object") return undefined;
+  const caused = (cause as NodeJS.ErrnoException).code;
+  return typeof caused === "string" && caused ? caused : undefined;
+}
+
+function deliveryFailure(error: unknown): DeliveryResult {
+  const code = errorCode(error);
+  const name =
+    error instanceof Error && error.name ? error.name.slice(0, 80) : undefined;
+  const upper = code?.toUpperCase() ?? "";
+  let phase: DeliveryFailurePhase = "unknown";
+  if (
+    name === "TimeoutError" ||
+    name === "AbortError" ||
+    ["ETIMEOUT", "ETIMEDOUT"].includes(upper)
+  ) {
+    phase = "timeout";
+  } else if (["ENOTFOUND", "EAI_AGAIN"].includes(upper)) {
+    phase = "dns";
+  } else if (
+    upper.includes("CERT") ||
+    upper.includes("TLS") ||
+    upper.includes("SSL")
+  ) {
+    phase = "tls";
+  } else if (
+    [
+      "ECONNREFUSED",
+      "ECONNRESET",
+      "ENETUNREACH",
+      "EHOSTUNREACH",
+      "EPIPE",
+    ].includes(upper)
+  ) {
+    phase = "connect";
+  }
+  return {
+    ok: false,
+    phase,
+    ...(code ? { errorCode: code.slice(0, 80) } : {}),
+    ...(name ? { errorName: name } : {}),
+  };
+}
+
+function normalizeDeliveryResult(
+  result: boolean | DeliveryResult,
+): DeliveryResult {
+  return typeof result === "boolean"
+    ? result
+      ? { ok: true, httpStatus: 200 }
+      : { ok: false, phase: "unknown" }
+    : result;
+}
+
+function diagnosticPath(
+  directory: string,
+  turn: string,
+  destination: Destination,
+): string {
+  return join(
+    directory,
+    `delivery-${turn}-${destinationDigest(destination)}.json`,
+  );
+}
+
+export function writeDeliveryDiagnostic(
+  directory: string,
+  turn: string,
+  destination: Destination,
+  result: DeliveryResult,
+): void {
+  ensurePrivateDirectory(directory);
+  const path = diagnosticPath(directory, turn, destination);
+  let attempt = 1;
+  try {
+    const previous = JSON.parse(readFileSync(path, "utf8")) as {
+      attempt?: unknown;
+    };
+    if (
+      typeof previous.attempt === "number" &&
+      Number.isSafeInteger(previous.attempt) &&
+      previous.attempt > 0
+    ) {
+      attempt = previous.attempt + 1;
+    }
+  } catch {
+    // The first attempt has no prior diagnostic.
+  }
+  const diagnostic: DeliveryDiagnostic = {
+    version: 1,
+    timestamp: Math.floor(Date.now() / 1_000),
+    destinationType: destination.type,
+    outcome: result.ok ? "sent" : "failed",
+    attempt,
+    ...(!result.ok
+      ? {
+          phase: result.phase,
+          ...(result.errorCode ? { errorCode: result.errorCode } : {}),
+          ...(result.errorName ? { errorName: result.errorName } : {}),
+        }
+      : {}),
+    ...(result.httpStatus !== undefined
+      ? { httpStatus: result.httpStatus }
+      : {}),
+  };
+  const temporary = `${path}.${process.pid}.tmp`;
+  writeFileSync(temporary, JSON.stringify(diagnostic), {
+    mode: 0o600,
+    flag: "wx",
+  });
+  renameSync(temporary, path);
 }
 
 export function readTurnStatus(
@@ -423,7 +574,7 @@ async function withPresenceLock<T>(work: () => Promise<T>): Promise<T | null> {
   const directory = stateDirectory();
   const lock = join(directory, "presence.lock");
   try {
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    ensurePrivateDirectory(directory);
     mkdirSync(lock, { mode: 0o700 });
   } catch {
     return null;
@@ -637,7 +788,7 @@ export async function sendDestination(
   destination: Destination,
   status: TerminalStatus,
   fetcher: typeof fetch = fetch,
-): Promise<boolean> {
+): Promise<DeliveryResult> {
   const { title, body, tags } = notificationText(status);
   try {
     if (destination.type === "ntfy") {
@@ -647,7 +798,9 @@ export async function sendDestination(
         headers: { Title: title, Tags: tags, Cache: "no" },
         signal: AbortSignal.timeout(10_000),
       });
-      return response.ok;
+      return response.ok
+        ? { ok: true, httpStatus: response.status }
+        : { ok: false, phase: "http", httpStatus: response.status };
     }
     const response = await fetcher(
       `https://api.telegram.org/bot${destination.bot_token}/sendMessage`,
@@ -661,12 +814,59 @@ export async function sendDestination(
         signal: AbortSignal.timeout(10_000),
       },
     );
-    if (!response.ok) return false;
-    const result = (await response.json()) as { ok?: unknown };
-    return result.ok === true;
-  } catch {
-    return false;
+    if (!response.ok)
+      return { ok: false, phase: "http", httpStatus: response.status };
+    try {
+      const result = (await response.json()) as { ok?: unknown };
+      return result.ok === true
+        ? { ok: true, httpStatus: response.status }
+        : { ok: false, phase: "response", httpStatus: response.status };
+    } catch (error) {
+      const failure = deliveryFailure(error);
+      return {
+        ...failure,
+        ok: false,
+        phase: "response",
+        httpStatus: response.status,
+      };
+    }
+  } catch (error) {
+    return deliveryFailure(error);
   }
+}
+
+export async function probeDestination(
+  destination: Destination,
+  fetcher: typeof fetch = fetch,
+): Promise<DeliveryResult> {
+  try {
+    const endpoint =
+      destination.type === "ntfy"
+        ? new URL(destination.url).origin
+        : "https://api.telegram.org";
+    const response = await fetcher(endpoint, {
+      method: "HEAD",
+      redirect: "manual",
+      signal: AbortSignal.timeout(10_000),
+    });
+    return response.status > 0 && response.status < 500
+      ? { ok: true, httpStatus: response.status }
+      : { ok: false, phase: "http", httpStatus: response.status };
+  } catch (error) {
+    return deliveryFailure(error);
+  }
+}
+
+export function deliveryResultText(result: DeliveryResult): string {
+  if (result.ok) return `HTTP ${result.httpStatus}`;
+  return [
+    `phase=${result.phase}`,
+    result.errorCode ? `code=${result.errorCode}` : "",
+    result.errorName ? `error=${result.errorName}` : "",
+    result.httpStatus !== undefined ? `HTTP=${result.httpStatus}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 function writeMarker(path: string, outcome: string): void {
@@ -730,9 +930,10 @@ export async function processTurn(
   supplied: ProcessTurnOptions = {},
 ): Promise<string> {
   const directory = supplied.state ?? stateDirectory();
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  ensurePrivateDirectory(directory);
   const digest = turnDigest(threadId, turnId);
   const skippedMarker = join(directory, `skipped-${digest}`);
+  const presenceCheckedMarker = join(directory, `presence-${digest}`);
   const maximumWaitMilliseconds =
     supplied.maximumWaitMilliseconds ?? MAX_WAIT_MILLISECONDS;
   const lock = join(directory, `worker-${digest}.lock`);
@@ -755,7 +956,10 @@ export async function processTurn(
       },
     );
     if (!status) return "timeout";
-    if (presenceSuppressionEnabled(config)) {
+    if (
+      presenceSuppressionEnabled(config) &&
+      !existsSync(presenceCheckedMarker)
+    ) {
       const grace = config.presence?.grace_seconds ?? 8;
       const acknowledged =
         supplied.acknowledgementChecker ?? userAcknowledgedCompletion;
@@ -763,6 +967,7 @@ export async function processTurn(
         writeMarker(skippedMarker, "present");
         return "skipped-present";
       }
+      writeMarker(presenceCheckedMarker, "not-present");
     }
     const sender = supplied.sender ?? sendDestination;
     const pending: Array<[Destination, string]> = [];
@@ -778,7 +983,14 @@ export async function processTurn(
     if (pending.length === 0) return "duplicate";
     let failures = 0;
     for (const [destination, marker] of pending) {
-      if (await sender(destination, status)) writeMarker(marker, "sent");
+      let result: DeliveryResult;
+      try {
+        result = normalizeDeliveryResult(await sender(destination, status));
+      } catch (error) {
+        result = deliveryFailure(error);
+      }
+      writeDeliveryDiagnostic(directory, digest, destination, result);
+      if (result.ok) writeMarker(marker, "sent");
       else failures += 1;
     }
     return failures ? "send-failed" : "sent";
@@ -789,7 +1001,7 @@ export async function processTurn(
 
 export function writeWorkerRequest(request: WorkerRequest): string {
   const directory = stateDirectory();
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  ensurePrivateDirectory(directory);
   const digest = turnDigest(request.threadId, request.turnId);
   const path = join(directory, `request-${digest}.json`);
   const temporary = `${path}.${process.pid}.tmp`;
@@ -843,6 +1055,131 @@ export function spawnWorker(request: WorkerRequest): void {
   subprocess.unref();
 }
 
+type QueueOutcome =
+  | "service-started"
+  | "sent"
+  | "skipped-present"
+  | "duplicate"
+  | "send-failed"
+  | "worker-active"
+  | "timeout"
+  | "invalid-request"
+  | "config-failed";
+
+function writeServiceDiagnostic(
+  outcome: QueueOutcome,
+  details: Record<string, string | number | boolean | undefined> = {},
+): void {
+  const directory = stateDirectory();
+  ensurePrivateDirectory(directory);
+  const path = join(directory, "service-diagnostic.json");
+  const temporary = `${path}.${process.pid}.tmp`;
+  writeFileSync(
+    temporary,
+    JSON.stringify({
+      version: 1,
+      timestamp: Math.floor(Date.now() / 1_000),
+      outcome,
+      ...Object.fromEntries(
+        Object.entries(details).filter(([, value]) => value !== undefined),
+      ),
+    }),
+    { mode: 0o600, flag: "wx" },
+  );
+  renameSync(temporary, path);
+}
+
+export function queuedRequestDigests(directory = stateDirectory()): string[] {
+  try {
+    return readdirSync(directory)
+      .map((name) => /^request-([a-f0-9]{64})\.json$/.exec(name)?.[1])
+      .filter((digest): digest is string => Boolean(digest))
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+export async function processQueuedRequest(
+  digest: string,
+): Promise<QueueOutcome> {
+  const loaded = readWorkerRequest(digest);
+  if (!loaded) {
+    writeServiceDiagnostic("invalid-request");
+    return "invalid-request";
+  }
+  let config: NotifyConfig;
+  try {
+    config = loadConfig();
+  } catch (error) {
+    writeServiceDiagnostic("config-failed", {
+      errorName: error instanceof Error ? error.name.slice(0, 80) : "Error",
+      errorMessage:
+        error instanceof Error ? error.message.slice(0, 300) : "unknown error",
+    });
+    return "config-failed";
+  }
+  const outcome = (await processTurn(
+    config,
+    loaded.request.threadId,
+    loaded.request.turnId,
+    loaded.request.status,
+    { maximumWaitMilliseconds: 5_000 },
+  )) as QueueOutcome;
+  writeServiceDiagnostic(outcome, { queueDigest: digest });
+  if (["sent", "skipped-present", "duplicate"].includes(outcome)) {
+    try {
+      unlinkSync(loaded.path);
+    } catch {
+      // Another service instance already removed it.
+    }
+  }
+  return outcome;
+}
+
+export async function processQueueOnce(
+  retryAfter: Map<string, number> = new Map(),
+  now = Date.now(),
+): Promise<Map<string, QueueOutcome>> {
+  const outcomes = new Map<string, QueueOutcome>();
+  for (const digest of queuedRequestDigests()) {
+    if ((retryAfter.get(digest) ?? 0) > now) continue;
+    const outcome = await processQueuedRequest(digest);
+    outcomes.set(digest, outcome);
+    if (
+      [
+        "send-failed",
+        "worker-active",
+        "config-failed",
+        "invalid-request",
+        "timeout",
+      ].includes(outcome)
+    ) {
+      retryAfter.set(digest, now + SERVICE_RETRY_MILLISECONDS);
+    } else {
+      retryAfter.delete(digest);
+    }
+  }
+  return outcomes;
+}
+
+export async function runQueueService(): Promise<number> {
+  ensurePrivateDirectory(stateDirectory());
+  const retryAfter = new Map<string, number>();
+  let running = true;
+  const stop = () => {
+    running = false;
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  writeServiceDiagnostic("service-started", { serviceStarted: true });
+  while (running) {
+    await processQueueOnce(retryAfter);
+    await Bun.sleep(SERVICE_POLL_MILLISECONDS);
+  }
+  return 0;
+}
+
 export async function checkConfiguration(): Promise<number> {
   try {
     const config = loadConfig();
@@ -869,10 +1206,15 @@ export async function sendTestNotification(): Promise<number> {
   }
   let failures = 0;
   for (const destination of config.destinations) {
-    if (await sendDestination(destination, "completed"))
-      console.log(`Test sent: ${destination.type}`);
-    else {
-      console.error(`Test failed: ${destination.type}`);
+    const result = await sendDestination(destination, "completed");
+    if (result.ok) {
+      console.log(
+        `Test sent: ${destination.type} (${deliveryResultText(result)})`,
+      );
+    } else {
+      console.error(
+        `Test failed: ${destination.type} (${deliveryResultText(result)})`,
+      );
       failures += 1;
     }
   }
@@ -884,6 +1226,39 @@ export async function diagnosePlatform(): Promise<number> {
   console.log(
     `Completion database: ${existsSync(historyDatabase()) ? "available" : "hook event fallback"}`,
   );
+  console.log(`Queued requests: ${queuedRequestDigests().length}`);
+  for (const name of [
+    "CODEX_NETWORK_PROXY_ACTIVE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NODE_USE_ENV_PROXY",
+  ]) {
+    console.log(`${name}: ${envPath(name) ? "configured" : "not configured"}`);
+  }
+  try {
+    const config = loadConfig();
+    for (const destination of config.destinations) {
+      const result = await probeDestination(destination);
+      console.log(
+        `Destination ${destination.type} connectivity: ${result.ok ? "available" : "unavailable"} (${deliveryResultText(result)})`,
+      );
+    }
+  } catch (error) {
+    console.log(
+      `Destination connectivity: configuration unavailable (${error instanceof Error ? error.name : "Error"})`,
+    );
+  }
+  try {
+    const diagnostic = JSON.parse(
+      readFileSync(join(stateDirectory(), "service-diagnostic.json"), "utf8"),
+    ) as Record<string, unknown>;
+    console.log(
+      `Last service outcome: ${typeof diagnostic.outcome === "string" ? diagnostic.outcome : "unknown"}`,
+    );
+  } catch {
+    console.log("Last service outcome: unavailable");
+  }
   if (platform() === "darwin") {
     console.log(
       `Idle-time API: ${macIdleSeconds() === null ? "unavailable" : "available"}`,
@@ -946,29 +1321,20 @@ export async function main(args = commandLineArguments()): Promise<number> {
   if (args.length === 1 && args[0] === "--check") return checkConfiguration();
   if (args.length === 1 && args[0] === "--test") return sendTestNotification();
   if (args.length === 1 && args[0] === "--diagnose") return diagnosePlatform();
+  if (args.length === 1 && args[0] === "--service") return runQueueService();
+  if (args.length === 1 && args[0] === "--service-once") {
+    const outcomes = await processQueueOnce();
+    return [...outcomes.values()].some((outcome) =>
+      ["send-failed", "config-failed", "invalid-request", "timeout"].includes(
+        outcome,
+      ),
+    )
+      ? 1
+      : 0;
+  }
   if (args.length === 2 && args[0] === "--worker") {
-    const loaded = readWorkerRequest(args[1]!);
-    if (!loaded) return 1;
-    let config: NotifyConfig;
-    try {
-      config = loadConfig();
-    } catch {
-      return 1;
-    }
-    const outcome = await processTurn(
-      config,
-      loaded.request.threadId,
-      loaded.request.turnId,
-      loaded.request.status,
-    );
-    if (["sent", "skipped-present", "duplicate"].includes(outcome)) {
-      try {
-        unlinkSync(loaded.path);
-      } catch {
-        // Another duplicate worker already removed it.
-      }
-    }
-    return outcome === "send-failed" ? 1 : 0;
+    const outcome = await processQueuedRequest(args[1]!);
+    return ["sent", "skipped-present", "duplicate"].includes(outcome) ? 0 : 1;
   }
   if (args.length !== 1) return 2;
   let event: Record<string, unknown>;
@@ -986,7 +1352,7 @@ export async function main(args = commandLineArguments()): Promise<number> {
   const status = TERMINAL_TURN_STATUSES.has(String(event.status))
     ? (event.status as TerminalStatus)
     : "completed";
-  spawnWorker({
+  writeWorkerRequest({
     threadId: event["thread-id"],
     turnId: event["turn-id"],
     status,

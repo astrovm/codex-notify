@@ -3,6 +3,7 @@ import { Database } from "bun:sqlite";
 import {
   chmodSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
   rmSync,
   writeFileSync,
@@ -16,6 +17,7 @@ import {
   loadConfig,
   notificationText,
   processTurn,
+  queuedRequestDigests,
   readTurnStatus,
   sessionBusAddress,
   sendDestination,
@@ -219,7 +221,10 @@ describe("destinations", () => {
         return new Response("", { status: 200 });
       },
     ) as unknown as typeof fetch;
-    expect(await sendDestination(ntfy, "completed", fetcher)).toBe(true);
+    expect(await sendDestination(ntfy, "completed", fetcher)).toEqual({
+      ok: true,
+      httpStatus: 200,
+    });
     expect(request?.url).toBe(ntfy.url);
     expect(await request?.text()).toBe("Codex task finished.");
   });
@@ -232,7 +237,10 @@ describe("destinations", () => {
         return Response.json({ ok: true });
       },
     ) as unknown as typeof fetch;
-    expect(await sendDestination(telegram, "completed", fetcher)).toBe(true);
+    expect(await sendDestination(telegram, "completed", fetcher)).toEqual({
+      ok: true,
+      httpStatus: 200,
+    });
     expect(request?.url).toBe(
       "https://api.telegram.org/botsynthetic-token/sendMessage",
     );
@@ -240,6 +248,78 @@ describe("destinations", () => {
       chat_id: "100",
       text: "Codex task finished\nCodex task finished.",
     });
+  });
+
+  test("reports an HTTP failure without response content", async () => {
+    const fetcher = mock(
+      async () => new Response("sensitive upstream detail", { status: 403 }),
+    ) as unknown as typeof fetch;
+    expect(await sendDestination(ntfy, "completed", fetcher)).toEqual({
+      ok: false,
+      phase: "http",
+      httpStatus: 403,
+    });
+  });
+
+  test("classifies DNS failures without destination data", async () => {
+    const fetcher = mock(async () => {
+      throw Object.assign(new Error("request failed for synthetic topic"), {
+        code: "ENOTFOUND",
+      });
+    }) as unknown as typeof fetch;
+    expect(await sendDestination(ntfy, "completed", fetcher)).toEqual({
+      ok: false,
+      phase: "dns",
+      errorCode: "ENOTFOUND",
+      errorName: "Error",
+    });
+  });
+});
+
+describe("private diagnostics", () => {
+  test("records safe delivery details and attempt count", async () => {
+    const state = temporaryDirectory();
+    const config: NotifyConfig = {
+      destinations: [telegram],
+      presence: { enabled: false },
+    };
+    const options = {
+      state,
+      historyPath: join(state, "missing"),
+      sender: async () => ({
+        ok: false as const,
+        phase: "timeout" as const,
+        errorCode: "ETIMEOUT",
+      }),
+    };
+    expect(
+      await processTurn(config, "thread", "failed-turn", "completed", options),
+    ).toBe("send-failed");
+    expect(
+      await processTurn(config, "thread", "failed-turn", "completed", options),
+    ).toBe("send-failed");
+    const diagnosticName = readdirSync(state).find((name) =>
+      name.startsWith("delivery-"),
+    );
+    expect(diagnosticName).toBeDefined();
+    const text = readFileSync(join(state, diagnosticName!), "utf8");
+    expect(text).not.toContain(telegram.bot_token);
+    expect(text).not.toContain(telegram.chat_id);
+    expect(JSON.parse(text)).toMatchObject({
+      destinationType: "telegram",
+      outcome: "failed",
+      attempt: 2,
+      phase: "timeout",
+      errorCode: "ETIMEOUT",
+    });
+  });
+
+  test("lists only valid queued request names", () => {
+    const state = temporaryDirectory();
+    const digest = "a".repeat(64);
+    writeFileSync(join(state, `request-${digest}.json`), "{}", { mode: 0o600 });
+    writeFileSync(join(state, "request-invalid.json"), "{}", { mode: 0o600 });
+    expect(queuedRequestDigests(state)).toEqual([digest]);
   });
 });
 
