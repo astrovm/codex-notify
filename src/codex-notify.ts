@@ -981,7 +981,6 @@ export async function processTurn(
   ensurePrivateDirectory(directory);
   const digest = turnDigest(threadId, turnId);
   const skippedMarker = join(directory, `skipped-${digest}`);
-  const presenceCheckedMarker = join(directory, `presence-${digest}`);
   const maximumWaitMilliseconds =
     supplied.maximumWaitMilliseconds ?? MAX_WAIT_MILLISECONDS;
   const lock = join(directory, `worker-${digest}.lock`);
@@ -1004,10 +1003,7 @@ export async function processTurn(
       },
     );
     if (!status) return "timeout";
-    if (
-      presenceSuppressionEnabled(config) &&
-      !existsSync(presenceCheckedMarker)
-    ) {
+    if (presenceSuppressionEnabled(config)) {
       const grace = config.presence?.grace_seconds ?? 8;
       const acknowledged =
         supplied.acknowledgementChecker ?? userAcknowledgedCompletion;
@@ -1015,7 +1011,6 @@ export async function processTurn(
         writeMarker(skippedMarker, "present");
         return "skipped-present";
       }
-      writeMarker(presenceCheckedMarker, "not-present");
     }
     const sender = supplied.sender ?? sendDestination;
     const pending: Array<[Destination, string]> = [];

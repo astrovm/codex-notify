@@ -303,6 +303,45 @@ describe("completion and deduplication", () => {
     expect(sender).toHaveBeenCalledTimes(1);
   });
 
+  test("checks presence again before retrying a failed delivery", async () => {
+    const state = temporaryDirectory();
+    const acknowledgements = [false, true];
+    const acknowledgementChecker = mock(
+      async () => acknowledgements.shift() ?? true,
+    );
+    const sender = mock(async () => false);
+    const config: NotifyConfig = {
+      destinations: [ntfy],
+      presence: { enabled: true, grace_seconds: 0 },
+    };
+    const options = {
+      state,
+      historyPath: join(state, "missing"),
+      sender,
+      acknowledgementChecker,
+    };
+    expect(
+      await processTurn(
+        config,
+        "thread-retry",
+        "turn-retry",
+        "completed",
+        options,
+      ),
+    ).toBe("send-failed");
+    expect(
+      await processTurn(
+        config,
+        "thread-retry",
+        "turn-retry",
+        "completed",
+        options,
+      ),
+    ).toBe("skipped-present");
+    expect(acknowledgementChecker).toHaveBeenCalledTimes(2);
+    expect(sender).toHaveBeenCalledTimes(1);
+  });
+
   test("uses stable hashes without writing secrets", async () => {
     expect(turnDigest("thread", "turn")).toHaveLength(64);
     expect(destinationDigest(telegram)).toHaveLength(16);
