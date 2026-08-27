@@ -1,6 +1,5 @@
 #!/usr/bin/env bun
 
-import { Database } from "bun:sqlite";
 import { dlopen, FFIType } from "bun:ffi";
 import { createHash } from "node:crypto";
 import {
@@ -16,16 +15,11 @@ import {
   renameSync,
   rmSync,
   statSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { homedir, platform } from "node:os";
 
-export const POLL_MILLISECONDS = 250;
-export const MAX_WAIT_MILLISECONDS = 24 * 60 * 60 * 1_000;
-export const SERVICE_POLL_MILLISECONDS = 1_000;
-export const SERVICE_RETRY_MILLISECONDS = 30_000;
 export const TERMINAL_TURN_STATUSES = new Set([
   "completed",
   "failed",
@@ -91,29 +85,13 @@ function presenceSuppressionEnabled(config: NotifyConfig): boolean {
   return config.presence?.enabled ?? true;
 }
 
-export interface TurnStatus {
-  status: string;
-  completedAt: number | null;
-}
-
-export interface WorkerRequest {
-  threadId: string;
-  turnId: string;
-  status: TerminalStatus;
-}
-
 export interface ProcessTurnOptions {
-  statusReader?: (threadId: string, turnId: string) => TurnStatus | null;
   acknowledgementChecker?: (graceSeconds: number) => Promise<boolean>;
   sender?: (
     destination: Destination,
     status: TerminalStatus,
   ) => Promise<boolean | DeliveryResult>;
-  sleep?: (milliseconds: number) => Promise<void>;
-  now?: () => number;
-  maximumWaitMilliseconds?: number;
   state?: string;
-  historyPath?: string;
 }
 
 export class ConfigError extends Error {}
@@ -121,10 +99,6 @@ export class ConfigError extends Error {}
 function envPath(name: string): string | undefined {
   const value = process.env[name]?.trim();
   return value || undefined;
-}
-
-export function codexHome(): string {
-  return envPath("CODEX_HOME") ?? join(homedir(), ".codex");
 }
 
 export function configPath(): string {
@@ -162,13 +136,6 @@ export function stateDirectory(): string {
 function ensurePrivateDirectory(path: string): void {
   mkdirSync(path, { recursive: true, mode: 0o700 });
   chmodSync(path, 0o700);
-}
-
-export function historyDatabase(): string {
-  return (
-    envPath("CODEX_NOTIFY_HISTORY_DATABASE") ??
-    join(codexHome(), "thread_history_1.sqlite")
-  );
 }
 
 function requirePrivateFile(path: string): void {
@@ -388,35 +355,6 @@ export function writeDeliveryDiagnostic(
     flag: "wx",
   });
   renameSync(temporary, path);
-}
-
-export function readTurnStatus(
-  threadId: string,
-  turnId: string,
-  databasePath = historyDatabase(),
-): TurnStatus | null {
-  if (!existsSync(databasePath)) return null;
-  let database: Database | undefined;
-  try {
-    database = new Database(databasePath, { readonly: true, strict: true });
-    const row = database
-      .query(
-        "SELECT status, completed_at FROM thread_turns WHERE thread_id = ? AND turn_id = ?",
-      )
-      .get(threadId, turnId) as {
-      status: unknown;
-      completed_at: unknown;
-    } | null;
-    if (!row) return null;
-    return {
-      status: String(row.status),
-      completedAt: row.completed_at === null ? null : Number(row.completed_at),
-    };
-  } catch {
-    return null;
-  } finally {
-    database?.close();
-  }
 }
 
 export function isActivityEvent(eventType: number, value: number): boolean {
@@ -878,41 +816,14 @@ function writeMarker(path: string, outcome: string): void {
   renameSync(temporary, path);
 }
 
-async function waitForTerminalStatus(
-  threadId: string,
-  turnId: string,
-  fallbackStatus: TerminalStatus,
-  options: Required<
-    Pick<
-      ProcessTurnOptions,
-      "statusReader" | "sleep" | "now" | "maximumWaitMilliseconds"
-    >
-  > & {
-    historyPath: string;
-  },
-): Promise<TerminalStatus | null> {
-  if (!existsSync(options.historyPath)) return fallbackStatus;
-  const deadline = options.now() + options.maximumWaitMilliseconds;
-  let turn = options.statusReader(threadId, turnId);
-  while (!turn || !TERMINAL_TURN_STATUSES.has(turn.status)) {
-    if (options.now() >= deadline) return null;
-    await options.sleep(POLL_MILLISECONDS);
-    turn = options.statusReader(threadId, turnId);
-  }
-  return turn.status as TerminalStatus;
-}
-
-function acquireTurnLock(
-  path: string,
-  maximumWaitMilliseconds: number,
-): boolean {
+function acquireTurnLock(path: string): boolean {
   try {
     mkdirSync(path, { mode: 0o700 });
     return true;
   } catch {
     try {
       const age = Date.now() - statSync(path).mtimeMs;
-      if (age <= maximumWaitMilliseconds + 60_000) return false;
+      if (age <= 60_000) return false;
       rmSync(path, { recursive: true, force: true });
       mkdirSync(path, { mode: 0o700 });
       return true;
@@ -934,28 +845,10 @@ export async function processTurn(
   const digest = turnDigest(threadId, turnId);
   const skippedMarker = join(directory, `skipped-${digest}`);
   const presenceCheckedMarker = join(directory, `presence-${digest}`);
-  const maximumWaitMilliseconds =
-    supplied.maximumWaitMilliseconds ?? MAX_WAIT_MILLISECONDS;
-  const lock = join(directory, `worker-${digest}.lock`);
-  if (!acquireTurnLock(lock, maximumWaitMilliseconds)) return "worker-active";
+  const lock = join(directory, `turn-${digest}.lock`);
+  if (!acquireTurnLock(lock)) return "turn-active";
   try {
     if (existsSync(skippedMarker)) return "duplicate";
-    const historyPath = supplied.historyPath ?? historyDatabase();
-    const status = await waitForTerminalStatus(
-      threadId,
-      turnId,
-      fallbackStatus,
-      {
-        historyPath,
-        statusReader:
-          supplied.statusReader ??
-          ((thread, turn) => readTurnStatus(thread, turn, historyPath)),
-        sleep: supplied.sleep ?? Bun.sleep,
-        now: supplied.now ?? Date.now,
-        maximumWaitMilliseconds,
-      },
-    );
-    if (!status) return "timeout";
     if (
       presenceSuppressionEnabled(config) &&
       !existsSync(presenceCheckedMarker)
@@ -985,199 +878,25 @@ export async function processTurn(
     for (const [destination, marker] of pending) {
       let result: DeliveryResult;
       try {
-        result = normalizeDeliveryResult(await sender(destination, status));
+        result = normalizeDeliveryResult(
+          await sender(destination, fallbackStatus),
+        );
       } catch (error) {
         result = deliveryFailure(error);
       }
       writeDeliveryDiagnostic(directory, digest, destination, result);
       if (result.ok) writeMarker(marker, "sent");
-      else failures += 1;
+      else {
+        console.error(
+          `codex-notify: ${destination.type} delivery failed (${deliveryResultText(result)})`,
+        );
+        failures += 1;
+      }
     }
     return failures ? "send-failed" : "sent";
   } finally {
     rmSync(lock, { recursive: true, force: true });
   }
-}
-
-export function writeWorkerRequest(request: WorkerRequest): string {
-  const directory = stateDirectory();
-  ensurePrivateDirectory(directory);
-  const digest = turnDigest(request.threadId, request.turnId);
-  const path = join(directory, `request-${digest}.json`);
-  const temporary = `${path}.${process.pid}.tmp`;
-  writeFileSync(temporary, JSON.stringify(request), {
-    mode: 0o600,
-    flag: "wx",
-  });
-  renameSync(temporary, path);
-  return digest;
-}
-
-export function readWorkerRequest(
-  digest: string,
-): { path: string; request: WorkerRequest } | null {
-  const path = join(stateDirectory(), `request-${digest}.json`);
-  try {
-    const value = JSON.parse(
-      readFileSync(path, "utf8"),
-    ) as Partial<WorkerRequest>;
-    if (
-      typeof value.threadId !== "string" ||
-      typeof value.turnId !== "string" ||
-      !TERMINAL_TURN_STATUSES.has(value.status ?? "")
-    ) {
-      return null;
-    }
-    return { path, request: value as WorkerRequest };
-  } catch {
-    return null;
-  }
-}
-
-function isRunningFromSource(): boolean {
-  return process.argv[1] === import.meta.path;
-}
-
-export function workerCommand(digest: string): string[] {
-  return isRunningFromSource()
-    ? [process.execPath, import.meta.path, "--worker", digest]
-    : [process.execPath, "--worker", digest];
-}
-
-export function spawnWorker(request: WorkerRequest): void {
-  const digest = writeWorkerRequest(request);
-  const subprocess = Bun.spawn({
-    cmd: workerCommand(digest),
-    stdin: "ignore",
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  subprocess.unref();
-}
-
-type QueueOutcome =
-  | "service-started"
-  | "sent"
-  | "skipped-present"
-  | "duplicate"
-  | "send-failed"
-  | "worker-active"
-  | "timeout"
-  | "invalid-request"
-  | "config-failed";
-
-function writeServiceDiagnostic(
-  outcome: QueueOutcome,
-  details: Record<string, string | number | boolean | undefined> = {},
-): void {
-  const directory = stateDirectory();
-  ensurePrivateDirectory(directory);
-  const path = join(directory, "service-diagnostic.json");
-  const temporary = `${path}.${process.pid}.tmp`;
-  writeFileSync(
-    temporary,
-    JSON.stringify({
-      version: 1,
-      timestamp: Math.floor(Date.now() / 1_000),
-      outcome,
-      ...Object.fromEntries(
-        Object.entries(details).filter(([, value]) => value !== undefined),
-      ),
-    }),
-    { mode: 0o600, flag: "wx" },
-  );
-  renameSync(temporary, path);
-}
-
-export function queuedRequestDigests(directory = stateDirectory()): string[] {
-  try {
-    return readdirSync(directory)
-      .map((name) => /^request-([a-f0-9]{64})\.json$/.exec(name)?.[1])
-      .filter((digest): digest is string => Boolean(digest))
-      .sort();
-  } catch {
-    return [];
-  }
-}
-
-export async function processQueuedRequest(
-  digest: string,
-): Promise<QueueOutcome> {
-  const loaded = readWorkerRequest(digest);
-  if (!loaded) {
-    writeServiceDiagnostic("invalid-request");
-    return "invalid-request";
-  }
-  let config: NotifyConfig;
-  try {
-    config = loadConfig();
-  } catch (error) {
-    writeServiceDiagnostic("config-failed", {
-      errorName: error instanceof Error ? error.name.slice(0, 80) : "Error",
-      errorMessage:
-        error instanceof Error ? error.message.slice(0, 300) : "unknown error",
-    });
-    return "config-failed";
-  }
-  const outcome = (await processTurn(
-    config,
-    loaded.request.threadId,
-    loaded.request.turnId,
-    loaded.request.status,
-    { maximumWaitMilliseconds: 5_000 },
-  )) as QueueOutcome;
-  writeServiceDiagnostic(outcome, { queueDigest: digest });
-  if (["sent", "skipped-present", "duplicate"].includes(outcome)) {
-    try {
-      unlinkSync(loaded.path);
-    } catch {
-      // Another service instance already removed it.
-    }
-  }
-  return outcome;
-}
-
-export async function processQueueOnce(
-  retryAfter: Map<string, number> = new Map(),
-  now = Date.now(),
-): Promise<Map<string, QueueOutcome>> {
-  const outcomes = new Map<string, QueueOutcome>();
-  for (const digest of queuedRequestDigests()) {
-    if ((retryAfter.get(digest) ?? 0) > now) continue;
-    const outcome = await processQueuedRequest(digest);
-    outcomes.set(digest, outcome);
-    if (
-      [
-        "send-failed",
-        "worker-active",
-        "config-failed",
-        "invalid-request",
-        "timeout",
-      ].includes(outcome)
-    ) {
-      retryAfter.set(digest, now + SERVICE_RETRY_MILLISECONDS);
-    } else {
-      retryAfter.delete(digest);
-    }
-  }
-  return outcomes;
-}
-
-export async function runQueueService(): Promise<number> {
-  ensurePrivateDirectory(stateDirectory());
-  const retryAfter = new Map<string, number>();
-  let running = true;
-  const stop = () => {
-    running = false;
-  };
-  process.once("SIGINT", stop);
-  process.once("SIGTERM", stop);
-  writeServiceDiagnostic("service-started", { serviceStarted: true });
-  while (running) {
-    await processQueueOnce(retryAfter);
-    await Bun.sleep(SERVICE_POLL_MILLISECONDS);
-  }
-  return 0;
 }
 
 export async function checkConfiguration(): Promise<number> {
@@ -1223,10 +942,6 @@ export async function sendTestNotification(): Promise<number> {
 
 export async function diagnosePlatform(): Promise<number> {
   console.log(`Platform: ${platform()}`);
-  console.log(
-    `Completion database: ${existsSync(historyDatabase()) ? "available" : "hook event fallback"}`,
-  );
-  console.log(`Queued requests: ${queuedRequestDigests().length}`);
   for (const name of [
     "CODEX_NETWORK_PROXY_ACTIVE",
     "HTTP_PROXY",
@@ -1248,16 +963,6 @@ export async function diagnosePlatform(): Promise<number> {
     console.log(
       `Destination connectivity: configuration unavailable (${error instanceof Error ? error.name : "Error"})`,
     );
-  }
-  try {
-    const diagnostic = JSON.parse(
-      readFileSync(join(stateDirectory(), "service-diagnostic.json"), "utf8"),
-    ) as Record<string, unknown>;
-    console.log(
-      `Last service outcome: ${typeof diagnostic.outcome === "string" ? diagnostic.outcome : "unknown"}`,
-    );
-  } catch {
-    console.log("Last service outcome: unavailable");
   }
   if (platform() === "darwin") {
     console.log(
@@ -1321,21 +1026,6 @@ export async function main(args = commandLineArguments()): Promise<number> {
   if (args.length === 1 && args[0] === "--check") return checkConfiguration();
   if (args.length === 1 && args[0] === "--test") return sendTestNotification();
   if (args.length === 1 && args[0] === "--diagnose") return diagnosePlatform();
-  if (args.length === 1 && args[0] === "--service") return runQueueService();
-  if (args.length === 1 && args[0] === "--service-once") {
-    const outcomes = await processQueueOnce();
-    return [...outcomes.values()].some((outcome) =>
-      ["send-failed", "config-failed", "invalid-request", "timeout"].includes(
-        outcome,
-      ),
-    )
-      ? 1
-      : 0;
-  }
-  if (args.length === 2 && args[0] === "--worker") {
-    const outcome = await processQueuedRequest(args[1]!);
-    return ["sent", "skipped-present", "duplicate"].includes(outcome) ? 0 : 1;
-  }
   if (args.length !== 1) return 2;
   let event: Record<string, unknown>;
   try {
@@ -1352,12 +1042,20 @@ export async function main(args = commandLineArguments()): Promise<number> {
   const status = TERMINAL_TURN_STATUSES.has(String(event.status))
     ? (event.status as TerminalStatus)
     : "completed";
-  writeWorkerRequest({
-    threadId: event["thread-id"],
-    turnId: event["turn-id"],
+  let config: NotifyConfig;
+  try {
+    config = loadConfig();
+  } catch (error) {
+    console.error(`codex-notify: ${(error as Error).message}`);
+    return 1;
+  }
+  const outcome = await processTurn(
+    config,
+    event["thread-id"],
+    event["turn-id"],
     status,
-  });
-  return 0;
+  );
+  return ["sent", "skipped-present", "duplicate"].includes(outcome) ? 0 : 1;
 }
 
 if (import.meta.main) {

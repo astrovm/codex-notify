@@ -10,7 +10,7 @@ The notification is deliberately generic. Prompt text, assistant responses, file
 - [Bun 1.4.0](https://bun.sh/docs/installation) or later to install, build, and test
 - Linux or macOS
 
-The installer compiles the TypeScript application into one native executable and enables a per-user delivery service. Bun is not required after installation.
+The installer compiles the TypeScript application into one native executable. Bun is not required when Codex runs the installed hook.
 
 ## Install
 
@@ -20,7 +20,7 @@ Run the portable installer:
 ./install.sh
 ```
 
-It installs into `~/.local/bin`, enables a systemd user service on Linux or a LaunchAgent on macOS, creates a private example configuration if one does not exist, and prints the `notify` line to add to Codex. It never changes `~/.codex/config.toml` automatically.
+It installs into `~/.local/bin`, creates a private example configuration if one does not exist, and prints the `notify` line to add to Codex. It never changes `~/.codex/config.toml` automatically.
 
 To build and install manually:
 
@@ -73,20 +73,7 @@ Check platform integration without reading notification secrets or sending anyth
 codex-notify --diagnose
 ```
 
-The diagnostic checks completion storage, proxy indicators, service state, and non-publishing destination connectivity. It reports safe failure phases and codes without printing URLs, topics, tokens, chat IDs, or response bodies.
-
-Inspect the delivery service on Linux:
-
-```sh
-systemctl --user status codex-notify.service
-journalctl --user -u codex-notify.service
-```
-
-Inspect it on macOS:
-
-```sh
-launchctl print "gui/$(id -u)/io.codex.notify"
-```
+The diagnostic checks platform integration, proxy indicators, and non-publishing destination connectivity. It reports safe failure phases and codes without printing URLs, topics, tokens, chat IDs, or response bodies.
 
 ### ntfy
 
@@ -125,15 +112,13 @@ The bot token is a secret. Do not commit the real configuration file. Revoke the
 
 You can include both destination objects to send through ntfy and Telegram.
 
-## Delivery service and duplicate prevention
+## Delivery and duplicate prevention
 
-The Codex hook only writes a private queue request. A persistent user service performs network delivery outside the hook process, retries transient failures every 30 seconds, and removes requests only after successful delivery or confirmed presence suppression. This keeps notification delivery independent from the hook's runtime network environment.
+The hook sends each notification directly before it exits. There is no daemon, background worker, queue, or platform service.
 
 Codex can invoke a notification hook more than once for the same event. This project creates an atomic marker for each `(thread-id, turn-id, destination)` tuple. Concurrent callbacks therefore send only once to each configured destination.
 
-When `~/.codex/thread_history_1.sqlite` exists, the notifier also waits until that exact turn has a terminal status. If a current Codex installation has not created the database yet, the notifier uses the completed hook event itself and the same per-turn deduplication.
-
-Persistent marker files contain hashed event and destination identifiers plus delivery outcomes. A private queue request contains the Codex thread ID, turn ID, and terminal status; it is deleted after successful delivery or presence suppression.
+Persistent marker files contain hashed event and destination identifiers plus delivery outcomes.
 
 Private `0600` diagnostic files record only safe fields: destination type, attempt count, delivery phase, error code or name, and HTTP status. State and diagnostic files never contain prompts, responses, destination URLs, topics, bot tokens, chat IDs, or HTTP response bodies.
 
@@ -176,7 +161,7 @@ bun run build
 ## Privacy and security
 
 - The configuration must have mode `600` or stricter.
-- Secrets are not included in process arguments or worker state.
+- Secrets are not included in process arguments or state files.
 - Notification messages contain only a generic completion status.
 - Delivery still reveals metadata such as your IP address and notification time to the selected service.
 - Telegram bots do not use end-to-end encryption.

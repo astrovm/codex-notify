@@ -17,10 +17,8 @@ install -m 600 "$source_directory/codex-notify-active-window.js" "$binary_direct
 
 if [ "$(uname -s)" = "Darwin" ]; then
     configuration_directory=${HOME}/Library/Application\ Support/codex-notify
-    state_directory=${HOME}/Library/Application\ Support/codex-notify/state
 else
     configuration_directory=${XDG_CONFIG_HOME:-${HOME}/.config}/codex-notify
-    state_directory=${XDG_STATE_HOME:-${HOME}/.local/state}/codex-notify
 fi
 
 mkdir -p "$configuration_directory"
@@ -32,50 +30,6 @@ if [ ! -e "$configuration_directory/config.json" ]; then
 else
     printf 'Kept existing %s\n' "$configuration_directory/config.json"
 fi
-
-migration_marker=${state_directory}/.queue-service-v1
-if [ ! -e "$migration_marker" ]; then
-    archive_directory=${state_directory}/pre-service-backlog
-    mkdir -p "$archive_directory"
-    chmod 700 "$state_directory" "$archive_directory"
-    backlog_count=$(find "$state_directory" -maxdepth 1 -type f -name 'request-*.json' | wc -l)
-    if [ "$backlog_count" -gt 0 ]; then
-        find "$state_directory" -maxdepth 1 -type f -name 'request-*.json' \
-            -exec mv {} "$archive_directory/" \;
-        printf 'Archived %s pre-service queue requests in %s\n' "$backlog_count" "$archive_directory"
-    fi
-    : > "$migration_marker"
-    chmod 600 "$migration_marker"
-fi
-
-case "$(uname -s)" in
-    Linux)
-        service_directory=${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user
-        mkdir -p "$service_directory"
-        install -m 600 "$source_directory/platform/systemd/codex-notify.service" "$service_directory/codex-notify.service"
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl --user daemon-reload
-            systemctl --user enable codex-notify.service
-            systemctl --user restart codex-notify.service
-            printf 'Enabled user service codex-notify.service\n'
-        else
-            printf 'Installed the systemd user service, but systemctl is unavailable.\n' >&2
-        fi
-        ;;
-    Darwin)
-        service_directory=${HOME}/Library/LaunchAgents
-        service_path=${service_directory}/io.codex.notify.plist
-        service_temporary=${service_path}.tmp
-        mkdir -p "$service_directory"
-        sed "s|__CODEX_NOTIFY_BINARY__|${binary_directory}/codex-notify|g" \
-            "$source_directory/platform/launchd/io.codex.notify.plist" > "$service_temporary"
-        chmod 600 "$service_temporary"
-        mv "$service_temporary" "$service_path"
-        launchctl bootout "gui/$(id -u)" "$service_path" >/dev/null 2>&1 || true
-        launchctl bootstrap "gui/$(id -u)" "$service_path"
-        printf 'Loaded LaunchAgent io.codex.notify\n'
-        ;;
-esac
 
 printf '\nInstalled %s\n' "$binary_directory/codex-notify"
 printf 'Add this line to %s/.codex/config.toml:\n\n' "$HOME"

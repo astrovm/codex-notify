@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { Database } from "bun:sqlite";
 import {
   chmodSync,
   mkdirSync,
@@ -15,10 +14,9 @@ import {
   destinationDigest,
   isActivityEvent,
   loadConfig,
+  main,
   notificationText,
   processTurn,
-  queuedRequestDigests,
-  readTurnStatus,
   sessionBusAddress,
   sendDestination,
   turnDigest,
@@ -85,23 +83,48 @@ describe("configuration", () => {
 });
 
 describe("completion and deduplication", () => {
-  test("reads the exact completed turn", () => {
-    const path = join(temporaryDirectory(), "history.sqlite");
-    const database = new Database(path);
-    database.run(
-      "CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT, status TEXT, completed_at INTEGER)",
+  test("handles a completion synchronously without a queue", async () => {
+    const root = temporaryDirectory();
+    const configPath = join(root, "config.json");
+    const state = join(root, "state");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        destinations: [ntfy],
+        presence: { enabled: false },
+      }),
+      { mode: 0o600 },
     );
-    database.run("INSERT INTO thread_turns VALUES (?, ?, ?, ?)", [
-      "thread-1",
-      "turn-1",
-      "completed",
-      123,
-    ]);
-    database.close();
-    expect(readTurnStatus("thread-1", "turn-1", path)).toEqual({
-      status: "completed",
-      completedAt: 123,
-    });
+    const previousConfig = process.env.CODEX_NOTIFY_CONFIG;
+    const previousState = process.env.CODEX_NOTIFY_STATE_DIRECTORY;
+    const previousFetch = globalThis.fetch;
+    process.env.CODEX_NOTIFY_CONFIG = configPath;
+    process.env.CODEX_NOTIFY_STATE_DIRECTORY = state;
+    globalThis.fetch = mock(
+      async () => new Response("", { status: 200 }),
+    ) as unknown as typeof fetch;
+    try {
+      expect(
+        await main([
+          JSON.stringify({
+            type: "agent-turn-complete",
+            "thread-id": "thread-main",
+            "turn-id": "turn-main",
+            status: "completed",
+          }),
+        ]),
+      ).toBe(0);
+      const names = readdirSync(state);
+      expect(names.some((name) => name.startsWith("sent-"))).toBe(true);
+      expect(names.some((name) => name.startsWith("request-"))).toBe(false);
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousConfig === undefined) delete process.env.CODEX_NOTIFY_CONFIG;
+      else process.env.CODEX_NOTIFY_CONFIG = previousConfig;
+      if (previousState === undefined)
+        delete process.env.CODEX_NOTIFY_STATE_DIRECTORY;
+      else process.env.CODEX_NOTIFY_STATE_DIRECTORY = previousState;
+    }
   });
 
   test("sends every destination once", async () => {
@@ -118,14 +141,12 @@ describe("completion and deduplication", () => {
     expect(
       await processTurn(config, "thread-1", "turn-1", "completed", {
         state,
-        historyPath: join(state, "missing"),
         sender,
       }),
     ).toBe("sent");
     expect(
       await processTurn(config, "thread-1", "turn-1", "completed", {
         state,
-        historyPath: join(state, "missing"),
         sender,
       }),
     ).toBe("duplicate");
@@ -142,7 +163,6 @@ describe("completion and deduplication", () => {
       "completed",
       {
         state,
-        historyPath: join(state, "missing"),
         sender,
       },
     );
@@ -160,7 +180,6 @@ describe("completion and deduplication", () => {
       "completed",
       {
         state,
-        historyPath: join(state, "missing"),
         sender,
         acknowledgementChecker,
       },
@@ -181,7 +200,6 @@ describe("completion and deduplication", () => {
       "completed",
       {
         state,
-        historyPath: join(state, "missing"),
         sender,
         acknowledgementChecker,
       },
@@ -202,13 +220,33 @@ describe("completion and deduplication", () => {
       "completed",
       {
         state,
-        historyPath: join(state, "missing"),
         sender: async () => true,
       },
     );
     const names = readdirSync(state).join(" ");
     expect(names).not.toContain("synthetic-token");
     expect(names).not.toContain("100");
+  });
+
+  test("uses the terminal status from the hook event", async () => {
+    const state = temporaryDirectory();
+    const statuses: string[] = [];
+    expect(
+      await processTurn(
+        { destinations: [ntfy], presence: { enabled: false } },
+        "thread-hook",
+        "turn-hook",
+        "completed",
+        {
+          state,
+          sender: async (_destination, status) => {
+            statuses.push(status);
+            return true;
+          },
+        },
+      ),
+    ).toBe("sent");
+    expect(statuses).toEqual(["completed"]);
   });
 });
 
@@ -285,7 +323,6 @@ describe("private diagnostics", () => {
     };
     const options = {
       state,
-      historyPath: join(state, "missing"),
       sender: async () => ({
         ok: false as const,
         phase: "timeout" as const,
@@ -312,14 +349,6 @@ describe("private diagnostics", () => {
       phase: "timeout",
       errorCode: "ETIMEOUT",
     });
-  });
-
-  test("lists only valid queued request names", () => {
-    const state = temporaryDirectory();
-    const digest = "a".repeat(64);
-    writeFileSync(join(state, `request-${digest}.json`), "{}", { mode: 0o600 });
-    writeFileSync(join(state, "request-invalid.json"), "{}", { mode: 0o600 });
-    expect(queuedRequestDigests(state)).toEqual([digest]);
   });
 });
 
