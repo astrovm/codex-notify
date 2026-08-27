@@ -110,10 +110,14 @@ describe("completion and deduplication", () => {
     const historyPath = join(state, "history.sqlite");
     writeFileSync(historyPath, "synthetic", { mode: 0o600 });
     const statuses = [
+      null,
       { status: "in_progress", completedAt: null },
       { status: "completed", completedAt: 123 },
     ];
-    const statusReader = mock(() => statuses.shift() ?? statuses.at(-1)!);
+    const statusReader = mock(() => {
+      const status = statuses.shift();
+      return status === undefined ? statuses.at(-1)! : status;
+    });
     const sleep = mock(async () => {});
     const sender = mock(async () => true);
     expect(
@@ -127,12 +131,80 @@ describe("completion and deduplication", () => {
           historyPath,
           statusReader,
           sleep,
+          rowDiscoveryWaitMilliseconds: 500,
           sender,
         },
       ),
     ).toBe("sent");
-    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledTimes(2);
     expect(sender).toHaveBeenCalledWith(ntfy, "completed");
+  });
+
+  test("uses the hook status when SQLite does not track the turn", async () => {
+    const state = temporaryDirectory();
+    const historyPath = join(state, "history.sqlite");
+    writeFileSync(historyPath, "synthetic", { mode: 0o600 });
+    let currentTime = 0;
+    const statusReader = mock(() => null);
+    const sleep = mock(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
+    const sender = mock(async () => true);
+    expect(
+      await processTurn(
+        { destinations: [ntfy], presence: { enabled: false } },
+        "untracked-thread",
+        "untracked-turn",
+        "completed",
+        {
+          state,
+          historyPath,
+          statusReader,
+          sleep,
+          now: () => currentTime,
+          rowDiscoveryWaitMilliseconds: 500,
+          sender,
+        },
+      ),
+    ).toBe("sent");
+    expect(statusReader).toHaveBeenCalledTimes(3);
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(sender).toHaveBeenCalledWith(ntfy, "completed");
+  });
+
+  test("keeps waiting when SQLite tracks a nonterminal turn", async () => {
+    const state = temporaryDirectory();
+    const historyPath = join(state, "history.sqlite");
+    writeFileSync(historyPath, "synthetic", { mode: 0o600 });
+    let currentTime = 0;
+    const statusReader = mock(() => ({
+      status: "inProgress",
+      completedAt: null,
+    }));
+    const sleep = mock(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
+    const sender = mock(async () => true);
+    expect(
+      await processTurn(
+        { destinations: [ntfy], presence: { enabled: false } },
+        "tracked-thread",
+        "tracked-turn",
+        "completed",
+        {
+          state,
+          historyPath,
+          statusReader,
+          sleep,
+          now: () => currentTime,
+          rowDiscoveryWaitMilliseconds: 0,
+          maximumWaitMilliseconds: 500,
+          sender,
+        },
+      ),
+    ).toBe("timeout");
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(sender).not.toHaveBeenCalled();
   });
 
   test("spawns a detached worker and leaves a private request", () => {
