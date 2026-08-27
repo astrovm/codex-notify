@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import { Database } from "bun:sqlite";
 import { dlopen, FFIType } from "bun:ffi";
 import { createHash } from "node:crypto";
 import {
@@ -15,11 +16,14 @@ import {
   renameSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir, platform } from "node:os";
 
+export const POLL_MILLISECONDS = 250;
+export const MAX_WAIT_MILLISECONDS = 24 * 60 * 60 * 1_000;
 export const TERMINAL_TURN_STATUSES = new Set([
   "completed",
   "failed",
@@ -85,13 +89,29 @@ function presenceSuppressionEnabled(config: NotifyConfig): boolean {
   return config.presence?.enabled ?? true;
 }
 
+export interface TurnStatus {
+  status: string;
+  completedAt: number | null;
+}
+
+export interface WorkerRequest {
+  threadId: string;
+  turnId: string;
+  status: TerminalStatus;
+}
+
 export interface ProcessTurnOptions {
+  statusReader?: (threadId: string, turnId: string) => TurnStatus | null;
   acknowledgementChecker?: (graceSeconds: number) => Promise<boolean>;
   sender?: (
     destination: Destination,
     status: TerminalStatus,
   ) => Promise<boolean | DeliveryResult>;
+  sleep?: (milliseconds: number) => Promise<void>;
+  now?: () => number;
+  maximumWaitMilliseconds?: number;
   state?: string;
+  historyPath?: string;
 }
 
 export class ConfigError extends Error {}
@@ -99,6 +119,10 @@ export class ConfigError extends Error {}
 function envPath(name: string): string | undefined {
   const value = process.env[name]?.trim();
   return value || undefined;
+}
+
+export function codexHome(): string {
+  return envPath("CODEX_HOME") ?? join(homedir(), ".codex");
 }
 
 export function configPath(): string {
@@ -131,6 +155,13 @@ export function stateDirectory(): string {
   }
   const root = envPath("XDG_STATE_HOME") ?? join(homedir(), ".local", "state");
   return join(root, "codex-notify");
+}
+
+export function historyDatabase(): string {
+  return (
+    envPath("CODEX_NOTIFY_HISTORY_DATABASE") ??
+    join(codexHome(), "thread_history_1.sqlite")
+  );
 }
 
 function ensurePrivateDirectory(path: string): void {
@@ -237,6 +268,35 @@ export function destinationDigest(destination: Destination): string {
     Object.entries(destination).sort(([a], [b]) => a.localeCompare(b)),
   );
   return hash(sorted).slice(0, 16);
+}
+
+export function readTurnStatus(
+  threadId: string,
+  turnId: string,
+  databasePath = historyDatabase(),
+): TurnStatus | null {
+  if (!existsSync(databasePath)) return null;
+  let database: Database | undefined;
+  try {
+    database = new Database(databasePath, { readonly: true, strict: true });
+    const row = database
+      .query(
+        "SELECT status, completed_at FROM thread_turns WHERE thread_id = ? AND turn_id = ?",
+      )
+      .get(threadId, turnId) as {
+      status: unknown;
+      completed_at: unknown;
+    } | null;
+    if (!row) return null;
+    return {
+      status: String(row.status),
+      completedAt: row.completed_at === null ? null : Number(row.completed_at),
+    };
+  } catch {
+    return null;
+  } finally {
+    database?.close();
+  }
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -354,6 +414,31 @@ export function writeDeliveryDiagnostic(
     mode: 0o600,
     flag: "wx",
   });
+  renameSync(temporary, path);
+}
+
+export function writeWorkerDiagnostic(
+  digest: string,
+  outcome: string,
+  error?: unknown,
+): void {
+  const directory = stateDirectory();
+  ensurePrivateDirectory(directory);
+  const path = join(directory, `worker-${digest}.json`);
+  const temporary = `${path}.${process.pid}.tmp`;
+  const name = error instanceof Error ? error.name.slice(0, 80) : undefined;
+  const code = errorCode(error);
+  writeFileSync(
+    temporary,
+    JSON.stringify({
+      version: 1,
+      timestamp: Math.floor(Date.now() / 1_000),
+      outcome,
+      ...(name ? { errorName: name } : {}),
+      ...(code ? { errorCode: code.slice(0, 80) } : {}),
+    }),
+    { mode: 0o600, flag: "wx" },
+  );
   renameSync(temporary, path);
 }
 
@@ -816,14 +901,41 @@ function writeMarker(path: string, outcome: string): void {
   renameSync(temporary, path);
 }
 
-function acquireTurnLock(path: string): boolean {
+async function waitForTerminalStatus(
+  threadId: string,
+  turnId: string,
+  fallbackStatus: TerminalStatus,
+  options: Required<
+    Pick<
+      ProcessTurnOptions,
+      "statusReader" | "sleep" | "now" | "maximumWaitMilliseconds"
+    >
+  > & {
+    historyPath: string;
+  },
+): Promise<TerminalStatus | null> {
+  if (!existsSync(options.historyPath)) return fallbackStatus;
+  const deadline = options.now() + options.maximumWaitMilliseconds;
+  let turn = options.statusReader(threadId, turnId);
+  while (!turn || !TERMINAL_TURN_STATUSES.has(turn.status)) {
+    if (options.now() >= deadline) return null;
+    await options.sleep(POLL_MILLISECONDS);
+    turn = options.statusReader(threadId, turnId);
+  }
+  return turn.status as TerminalStatus;
+}
+
+function acquireTurnLock(
+  path: string,
+  maximumWaitMilliseconds: number,
+): boolean {
   try {
     mkdirSync(path, { mode: 0o700 });
     return true;
   } catch {
     try {
       const age = Date.now() - statSync(path).mtimeMs;
-      if (age <= 60_000) return false;
+      if (age <= maximumWaitMilliseconds + 60_000) return false;
       rmSync(path, { recursive: true, force: true });
       mkdirSync(path, { mode: 0o700 });
       return true;
@@ -845,10 +957,28 @@ export async function processTurn(
   const digest = turnDigest(threadId, turnId);
   const skippedMarker = join(directory, `skipped-${digest}`);
   const presenceCheckedMarker = join(directory, `presence-${digest}`);
-  const lock = join(directory, `turn-${digest}.lock`);
-  if (!acquireTurnLock(lock)) return "turn-active";
+  const maximumWaitMilliseconds =
+    supplied.maximumWaitMilliseconds ?? MAX_WAIT_MILLISECONDS;
+  const lock = join(directory, `worker-${digest}.lock`);
+  if (!acquireTurnLock(lock, maximumWaitMilliseconds)) return "worker-active";
   try {
     if (existsSync(skippedMarker)) return "duplicate";
+    const historyPath = supplied.historyPath ?? historyDatabase();
+    const status = await waitForTerminalStatus(
+      threadId,
+      turnId,
+      fallbackStatus,
+      {
+        historyPath,
+        statusReader:
+          supplied.statusReader ??
+          ((thread, turn) => readTurnStatus(thread, turn, historyPath)),
+        sleep: supplied.sleep ?? Bun.sleep,
+        now: supplied.now ?? Date.now,
+        maximumWaitMilliseconds,
+      },
+    );
+    if (!status) return "timeout";
     if (
       presenceSuppressionEnabled(config) &&
       !existsSync(presenceCheckedMarker)
@@ -878,9 +1008,7 @@ export async function processTurn(
     for (const [destination, marker] of pending) {
       let result: DeliveryResult;
       try {
-        result = normalizeDeliveryResult(
-          await sender(destination, fallbackStatus),
-        );
+        result = normalizeDeliveryResult(await sender(destination, status));
       } catch (error) {
         result = deliveryFailure(error);
       }
@@ -896,6 +1024,72 @@ export async function processTurn(
     return failures ? "send-failed" : "sent";
   } finally {
     rmSync(lock, { recursive: true, force: true });
+  }
+}
+
+export function writeWorkerRequest(request: WorkerRequest): string {
+  const directory = stateDirectory();
+  ensurePrivateDirectory(directory);
+  const digest = turnDigest(request.threadId, request.turnId);
+  const path = join(directory, `request-${digest}.json`);
+  const temporary = `${path}.${process.pid}.tmp`;
+  writeFileSync(temporary, JSON.stringify(request), {
+    mode: 0o600,
+    flag: "wx",
+  });
+  renameSync(temporary, path);
+  return digest;
+}
+
+export function readWorkerRequest(
+  digest: string,
+): { path: string; request: WorkerRequest } | null {
+  const path = join(stateDirectory(), `request-${digest}.json`);
+  try {
+    const value = JSON.parse(
+      readFileSync(path, "utf8"),
+    ) as Partial<WorkerRequest>;
+    if (
+      typeof value.threadId !== "string" ||
+      typeof value.turnId !== "string" ||
+      !TERMINAL_TURN_STATUSES.has(value.status ?? "")
+    ) {
+      return null;
+    }
+    return { path, request: value as WorkerRequest };
+  } catch {
+    return null;
+  }
+}
+
+export function workerCommand(
+  digest: string,
+  executable = process.execPath,
+  modulePath = import.meta.path,
+): string[] {
+  return modulePath.startsWith("/$bunfs/")
+    ? [executable, "--worker", digest]
+    : [executable, modulePath, "--worker", digest];
+}
+
+export function spawnWorker(
+  request: WorkerRequest,
+  spawn: typeof Bun.spawn = Bun.spawn,
+): void {
+  const digest = writeWorkerRequest(request);
+  writeWorkerDiagnostic(digest, "spawning");
+  try {
+    const subprocess = spawn({
+      cmd: workerCommand(digest),
+      detached: true,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    subprocess.unref();
+  } catch (error) {
+    writeWorkerDiagnostic(digest, "spawn-failed", error);
+    throw error;
   }
 }
 
@@ -942,6 +1136,9 @@ export async function sendTestNotification(): Promise<number> {
 
 export async function diagnosePlatform(): Promise<number> {
   console.log(`Platform: ${platform()}`);
+  console.log(
+    `Completion database: ${existsSync(historyDatabase()) ? "available" : "hook event fallback"}`,
+  );
   for (const name of [
     "CODEX_NETWORK_PROXY_ACTIVE",
     "HTTP_PROXY",
@@ -1026,6 +1223,38 @@ export async function main(args = commandLineArguments()): Promise<number> {
   if (args.length === 1 && args[0] === "--check") return checkConfiguration();
   if (args.length === 1 && args[0] === "--test") return sendTestNotification();
   if (args.length === 1 && args[0] === "--diagnose") return diagnosePlatform();
+  if (args.length === 2 && args[0] === "--worker") {
+    const digest = args[1]!;
+    const loaded = readWorkerRequest(digest);
+    if (!loaded) {
+      writeWorkerDiagnostic(digest, "invalid-request");
+      return 1;
+    }
+    writeWorkerDiagnostic(digest, "started");
+    let config: NotifyConfig;
+    try {
+      config = loadConfig();
+    } catch (error) {
+      writeWorkerDiagnostic(digest, "config-failed", error);
+      return 1;
+    }
+    const outcome = await processTurn(
+      config,
+      loaded.request.threadId,
+      loaded.request.turnId,
+      loaded.request.status,
+    );
+    writeWorkerDiagnostic(digest, outcome);
+    if (["sent", "skipped-present", "duplicate"].includes(outcome)) {
+      try {
+        unlinkSync(loaded.path);
+      } catch {
+        // Another duplicate worker already removed it.
+      }
+      return 0;
+    }
+    return 1;
+  }
   if (args.length !== 1) return 2;
   let event: Record<string, unknown>;
   try {
@@ -1042,20 +1271,17 @@ export async function main(args = commandLineArguments()): Promise<number> {
   const status = TERMINAL_TURN_STATUSES.has(String(event.status))
     ? (event.status as TerminalStatus)
     : "completed";
-  let config: NotifyConfig;
   try {
-    config = loadConfig();
+    spawnWorker({
+      threadId: event["thread-id"],
+      turnId: event["turn-id"],
+      status,
+    });
   } catch (error) {
-    console.error(`codex-notify: ${(error as Error).message}`);
+    console.error(`codex-notify: worker spawn failed (${String(error)})`);
     return 1;
   }
-  const outcome = await processTurn(
-    config,
-    event["thread-id"],
-    event["turn-id"],
-    status,
-  );
-  return ["sent", "skipped-present", "duplicate"].includes(outcome) ? 0 : 1;
+  return 0;
 }
 
 if (import.meta.main) {

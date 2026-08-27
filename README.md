@@ -73,7 +73,7 @@ Check platform integration without reading notification secrets or sending anyth
 codex-notify --diagnose
 ```
 
-The diagnostic checks platform integration, proxy indicators, and non-publishing destination connectivity. It reports safe failure phases and codes without printing URLs, topics, tokens, chat IDs, or response bodies.
+The diagnostic checks completion storage, platform integration, proxy indicators, and non-publishing destination connectivity. It reports safe failure phases and codes without printing URLs, topics, tokens, chat IDs, or response bodies.
 
 ### ntfy
 
@@ -114,13 +114,15 @@ You can include both destination objects to send through ntfy and Telegram.
 
 ## Delivery and duplicate prevention
 
-The hook sends each notification directly before it exits. There is no daemon, background worker, queue, or platform service.
+The hook writes one private request and starts a detached per-turn worker. The hook then exits so Codex can finish recording the turn. There is no daemon or platform service.
 
 Codex can invoke a notification hook more than once for the same event. This project creates an atomic marker for each `(thread-id, turn-id, destination)` tuple. Concurrent callbacks therefore send only once to each configured destination.
 
-Persistent marker files contain hashed event and destination identifiers plus delivery outcomes.
+When `~/.codex/thread_history_1.sqlite` exists, the worker waits until that exact turn has a terminal status. If a current Codex installation has not created the database yet, the worker uses the completed hook event itself and the same per-turn deduplication.
 
-Private `0600` diagnostic files record only safe fields: destination type, attempt count, delivery phase, error code or name, and HTTP status. State and diagnostic files never contain prompts, responses, destination URLs, topics, bot tokens, chat IDs, or HTTP response bodies.
+Persistent marker files contain hashed event and destination identifiers plus delivery outcomes. A temporary private worker request contains the Codex thread ID, turn ID, and terminal status; it is deleted after successful delivery or presence suppression.
+
+Private `0600` diagnostic files record only safe fields: worker outcome, destination type, attempt count, delivery phase, error code or name, and HTTP status. State and diagnostic files never contain prompts, responses, destination URLs, topics, bot tokens, chat IDs, or HTTP response bodies.
 
 ## Presence suppression
 

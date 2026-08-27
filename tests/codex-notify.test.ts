@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import {
   chmodSync,
   mkdirSync,
@@ -14,12 +15,14 @@ import {
   destinationDigest,
   isActivityEvent,
   loadConfig,
-  main,
   notificationText,
   processTurn,
+  readTurnStatus,
   sessionBusAddress,
   sendDestination,
+  spawnWorker,
   turnDigest,
+  workerCommand,
   type Destination,
   type NotifyConfig,
 } from "../src/codex-notify.ts";
@@ -83,48 +86,104 @@ describe("configuration", () => {
 });
 
 describe("completion and deduplication", () => {
-  test("handles a completion synchronously without a queue", async () => {
-    const root = temporaryDirectory();
-    const configPath = join(root, "config.json");
-    const state = join(root, "state");
-    writeFileSync(
-      configPath,
-      JSON.stringify({
-        destinations: [ntfy],
-        presence: { enabled: false },
-      }),
-      { mode: 0o600 },
+  test("reads the exact completed turn", () => {
+    const path = join(temporaryDirectory(), "history.sqlite");
+    const database = new Database(path);
+    database.run(
+      "CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT, status TEXT, completed_at INTEGER)",
     );
-    const previousConfig = process.env.CODEX_NOTIFY_CONFIG;
+    database.run("INSERT INTO thread_turns VALUES (?, ?, ?, ?)", [
+      "thread-1",
+      "turn-1",
+      "completed",
+      123,
+    ]);
+    database.close();
+    expect(readTurnStatus("thread-1", "turn-1", path)).toEqual({
+      status: "completed",
+      completedAt: 123,
+    });
+  });
+
+  test("waits for the exact turn to become terminal before sending", async () => {
+    const state = temporaryDirectory();
+    const historyPath = join(state, "history.sqlite");
+    writeFileSync(historyPath, "synthetic", { mode: 0o600 });
+    const statuses = [
+      { status: "in_progress", completedAt: null },
+      { status: "completed", completedAt: 123 },
+    ];
+    const statusReader = mock(() => statuses.shift() ?? statuses.at(-1)!);
+    const sleep = mock(async () => {});
+    const sender = mock(async () => true);
+    expect(
+      await processTurn(
+        { destinations: [ntfy], presence: { enabled: false } },
+        "thread-wait",
+        "turn-wait",
+        "completed",
+        {
+          state,
+          historyPath,
+          statusReader,
+          sleep,
+          sender,
+        },
+      ),
+    ).toBe("sent");
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sender).toHaveBeenCalledWith(ntfy, "completed");
+  });
+
+  test("spawns a detached worker and leaves a private request", () => {
+    const root = temporaryDirectory();
+    const state = join(root, "state");
     const previousState = process.env.CODEX_NOTIFY_STATE_DIRECTORY;
-    const previousFetch = globalThis.fetch;
-    process.env.CODEX_NOTIFY_CONFIG = configPath;
     process.env.CODEX_NOTIFY_STATE_DIRECTORY = state;
-    globalThis.fetch = mock(
-      async () => new Response("", { status: 200 }),
-    ) as unknown as typeof fetch;
+    let options: Record<string, unknown> | undefined;
+    const unref = mock(() => {});
+    const spawn = mock((supplied: Record<string, unknown>) => {
+      options = supplied;
+      return { unref };
+    }) as unknown as typeof Bun.spawn;
     try {
-      expect(
-        await main([
-          JSON.stringify({
-            type: "agent-turn-complete",
-            "thread-id": "thread-main",
-            "turn-id": "turn-main",
-            status: "completed",
-          }),
-        ]),
-      ).toBe(0);
+      spawnWorker(
+        {
+          threadId: "thread-main",
+          turnId: "turn-main",
+          status: "completed",
+        },
+        spawn,
+      );
+      expect(options?.detached).toBe(true);
+      expect(options?.stdin).toBe("ignore");
+      expect(unref).toHaveBeenCalledTimes(1);
       const names = readdirSync(state);
-      expect(names.some((name) => name.startsWith("sent-"))).toBe(true);
-      expect(names.some((name) => name.startsWith("request-"))).toBe(false);
+      expect(names.some((name) => name.startsWith("request-"))).toBe(true);
+      expect(names.some((name) => name.endsWith(".json"))).toBe(true);
     } finally {
-      globalThis.fetch = previousFetch;
-      if (previousConfig === undefined) delete process.env.CODEX_NOTIFY_CONFIG;
-      else process.env.CODEX_NOTIFY_CONFIG = previousConfig;
       if (previousState === undefined)
         delete process.env.CODEX_NOTIFY_STATE_DIRECTORY;
       else process.env.CODEX_NOTIFY_STATE_DIRECTORY = previousState;
     }
+  });
+
+  test("builds source and compiled worker commands without extra arguments", () => {
+    expect(
+      workerCommand("digest", "/usr/bin/bun", "/project/src/codex-notify.ts"),
+    ).toEqual([
+      "/usr/bin/bun",
+      "/project/src/codex-notify.ts",
+      "--worker",
+      "digest",
+    ]);
+    expect(
+      workerCommand(
+        "digest",
+        "/project/dist/codex-notify",
+        "/$bunfs/root/codex-notify",
+      ),
+    ).toEqual(["/project/dist/codex-notify", "--worker", "digest"]);
   });
 
   test("sends every destination once", async () => {
@@ -141,12 +200,14 @@ describe("completion and deduplication", () => {
     expect(
       await processTurn(config, "thread-1", "turn-1", "completed", {
         state,
+        historyPath: join(state, "missing"),
         sender,
       }),
     ).toBe("sent");
     expect(
       await processTurn(config, "thread-1", "turn-1", "completed", {
         state,
+        historyPath: join(state, "missing"),
         sender,
       }),
     ).toBe("duplicate");
@@ -163,6 +224,7 @@ describe("completion and deduplication", () => {
       "completed",
       {
         state,
+        historyPath: join(state, "missing"),
         sender,
       },
     );
@@ -180,6 +242,7 @@ describe("completion and deduplication", () => {
       "completed",
       {
         state,
+        historyPath: join(state, "missing"),
         sender,
         acknowledgementChecker,
       },
@@ -200,6 +263,7 @@ describe("completion and deduplication", () => {
       "completed",
       {
         state,
+        historyPath: join(state, "missing"),
         sender,
         acknowledgementChecker,
       },
@@ -220,6 +284,7 @@ describe("completion and deduplication", () => {
       "completed",
       {
         state,
+        historyPath: join(state, "missing"),
         sender: async () => true,
       },
     );
@@ -239,6 +304,7 @@ describe("completion and deduplication", () => {
         "completed",
         {
           state,
+          historyPath: join(state, "missing"),
           sender: async (_destination, status) => {
             statuses.push(status);
             return true;
@@ -323,6 +389,7 @@ describe("private diagnostics", () => {
     };
     const options = {
       state,
+      historyPath: join(state, "missing"),
       sender: async () => ({
         ok: false as const,
         phase: "timeout" as const,
