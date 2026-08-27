@@ -168,6 +168,36 @@ describe("completion and deduplication", () => {
     }
   });
 
+  test("spawns the worker when its diagnostic cannot be written", () => {
+    const root = temporaryDirectory();
+    const state = join(root, "state");
+    mkdirSync(state, { mode: 0o700 });
+    const previousState = process.env.CODEX_NOTIFY_STATE_DIRECTORY;
+    process.env.CODEX_NOTIFY_STATE_DIRECTORY = state;
+    const request = {
+      threadId: "thread-diagnostic-failure",
+      turnId: "turn-diagnostic-failure",
+      status: "completed" as const,
+    };
+    const digest = turnDigest(request.threadId, request.turnId);
+    writeFileSync(
+      join(state, `worker-${digest}.json.${process.pid}.tmp`),
+      "stale",
+      { mode: 0o600 },
+    );
+    const unref = mock(() => {});
+    const spawn = mock(() => ({ unref })) as unknown as typeof Bun.spawn;
+    try {
+      expect(() => spawnWorker(request, spawn)).not.toThrow();
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(unref).toHaveBeenCalledTimes(1);
+    } finally {
+      if (previousState === undefined)
+        delete process.env.CODEX_NOTIFY_STATE_DIRECTORY;
+      else process.env.CODEX_NOTIFY_STATE_DIRECTORY = previousState;
+    }
+  });
+
   test("builds source and compiled worker commands without extra arguments", () => {
     expect(
       workerCommand("digest", "/usr/bin/bun", "/project/src/codex-notify.ts"),
@@ -313,6 +343,38 @@ describe("completion and deduplication", () => {
       ),
     ).toBe("sent");
     expect(statuses).toEqual(["completed"]);
+  });
+
+  test("records successful delivery when its diagnostic cannot be written", async () => {
+    const state = temporaryDirectory();
+    const threadId = "thread-diagnostic-failure";
+    const turnId = "turn-diagnostic-failure";
+    const digest = turnDigest(threadId, turnId);
+    writeFileSync(
+      join(
+        state,
+        `delivery-${digest}-${destinationDigest(ntfy)}.json.${process.pid}.tmp`,
+      ),
+      "stale",
+      { mode: 0o600 },
+    );
+    const sender = mock(async () => true);
+    const options = {
+      state,
+      historyPath: join(state, "missing"),
+      sender,
+    };
+    const config: NotifyConfig = {
+      destinations: [ntfy],
+      presence: { enabled: false },
+    };
+    expect(
+      await processTurn(config, threadId, turnId, "completed", options),
+    ).toBe("sent");
+    expect(
+      await processTurn(config, threadId, turnId, "completed", options),
+    ).toBe("duplicate");
+    expect(sender).toHaveBeenCalledTimes(1);
   });
 });
 

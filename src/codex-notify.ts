@@ -442,6 +442,31 @@ export function writeWorkerDiagnostic(
   renameSync(temporary, path);
 }
 
+function tryWriteDeliveryDiagnostic(
+  directory: string,
+  turn: string,
+  destination: Destination,
+  result: DeliveryResult,
+): void {
+  try {
+    writeDeliveryDiagnostic(directory, turn, destination, result);
+  } catch (error) {
+    debug(`delivery diagnostic failed: ${String(error)}`);
+  }
+}
+
+function tryWriteWorkerDiagnostic(
+  digest: string,
+  outcome: string,
+  error?: unknown,
+): void {
+  try {
+    writeWorkerDiagnostic(digest, outcome, error);
+  } catch (diagnosticError) {
+    debug(`worker diagnostic failed: ${String(diagnosticError)}`);
+  }
+}
+
 export function isActivityEvent(eventType: number, value: number): boolean {
   if (eventType === EV_KEY) return value === 1 || value === 2;
   return (eventType === EV_REL || eventType === EV_ABS) && value !== 0;
@@ -1012,9 +1037,11 @@ export async function processTurn(
       } catch (error) {
         result = deliveryFailure(error);
       }
-      writeDeliveryDiagnostic(directory, digest, destination, result);
-      if (result.ok) writeMarker(marker, "sent");
-      else {
+      if (result.ok) {
+        writeMarker(marker, "sent");
+        tryWriteDeliveryDiagnostic(directory, digest, destination, result);
+      } else {
+        tryWriteDeliveryDiagnostic(directory, digest, destination, result);
         console.error(
           `codex-notify: ${destination.type} delivery failed (${deliveryResultText(result)})`,
         );
@@ -1077,7 +1104,7 @@ export function spawnWorker(
   spawn: typeof Bun.spawn = Bun.spawn,
 ): void {
   const digest = writeWorkerRequest(request);
-  writeWorkerDiagnostic(digest, "spawning");
+  tryWriteWorkerDiagnostic(digest, "spawning");
   try {
     const subprocess = spawn({
       cmd: workerCommand(digest),
@@ -1088,7 +1115,7 @@ export function spawnWorker(
     });
     subprocess.unref();
   } catch (error) {
-    writeWorkerDiagnostic(digest, "spawn-failed", error);
+    tryWriteWorkerDiagnostic(digest, "spawn-failed", error);
     throw error;
   }
 }
@@ -1227,15 +1254,15 @@ export async function main(args = commandLineArguments()): Promise<number> {
     const digest = args[1]!;
     const loaded = readWorkerRequest(digest);
     if (!loaded) {
-      writeWorkerDiagnostic(digest, "invalid-request");
+      tryWriteWorkerDiagnostic(digest, "invalid-request");
       return 1;
     }
-    writeWorkerDiagnostic(digest, "started");
+    tryWriteWorkerDiagnostic(digest, "started");
     let config: NotifyConfig;
     try {
       config = loadConfig();
     } catch (error) {
-      writeWorkerDiagnostic(digest, "config-failed", error);
+      tryWriteWorkerDiagnostic(digest, "config-failed", error);
       return 1;
     }
     const outcome = await processTurn(
@@ -1244,7 +1271,7 @@ export async function main(args = commandLineArguments()): Promise<number> {
       loaded.request.turnId,
       loaded.request.status,
     );
-    writeWorkerDiagnostic(digest, outcome);
+    tryWriteWorkerDiagnostic(digest, outcome);
     if (["sent", "skipped-present", "duplicate"].includes(outcome)) {
       try {
         unlinkSync(loaded.path);
