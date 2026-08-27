@@ -4,6 +4,7 @@ import { Database } from "bun:sqlite";
 import { dlopen, FFIType } from "bun:ffi";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   closeSync,
   constants,
   existsSync,
@@ -18,7 +19,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { homedir, platform } from "node:os";
 
 export const POLL_MILLISECONDS = 250;
@@ -37,6 +38,31 @@ const EV_REL = 0x02;
 const EV_ABS = 0x03;
 
 export type TerminalStatus = "completed" | "failed" | "interrupted";
+
+export type DeliveryFailurePhase =
+  "dns" | "connect" | "tls" | "timeout" | "http" | "response" | "unknown";
+
+export type DeliveryResult =
+  | { ok: true; httpStatus: number }
+  | {
+      ok: false;
+      phase: DeliveryFailurePhase;
+      errorCode?: string;
+      errorName?: string;
+      httpStatus?: number;
+    };
+
+export interface DeliveryDiagnostic {
+  version: 1;
+  timestamp: number;
+  destinationType: Destination["type"];
+  outcome: "sent" | "failed";
+  attempt: number;
+  phase?: DeliveryFailurePhase;
+  errorCode?: string;
+  errorName?: string;
+  httpStatus?: number;
+}
 
 export interface NtfyDestination {
   type: "ntfy";
@@ -80,7 +106,7 @@ export interface ProcessTurnOptions {
   sender?: (
     destination: Destination,
     status: TerminalStatus,
-  ) => Promise<boolean>;
+  ) => Promise<boolean | DeliveryResult>;
   sleep?: (milliseconds: number) => Promise<void>;
   now?: () => number;
   maximumWaitMilliseconds?: number;
@@ -136,6 +162,11 @@ export function historyDatabase(): string {
     envPath("CODEX_NOTIFY_HISTORY_DATABASE") ??
     join(codexHome(), "thread_history_1.sqlite")
   );
+}
+
+function ensurePrivateDirectory(path: string): void {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  chmodSync(path, 0o700);
 }
 
 function requirePrivateFile(path: string): void {
@@ -265,6 +296,174 @@ export function readTurnStatus(
     return null;
   } finally {
     database?.close();
+  }
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const direct = (error as NodeJS.ErrnoException).code;
+  if (typeof direct === "string" && direct) return direct;
+  const cause = (error as { cause?: unknown }).cause;
+  if (!cause || typeof cause !== "object") return undefined;
+  const caused = (cause as NodeJS.ErrnoException).code;
+  return typeof caused === "string" && caused ? caused : undefined;
+}
+
+function deliveryFailure(error: unknown): DeliveryResult {
+  const code = errorCode(error);
+  const name =
+    error instanceof Error && error.name ? error.name.slice(0, 80) : undefined;
+  const upper = code?.toUpperCase() ?? "";
+  let phase: DeliveryFailurePhase = "unknown";
+  if (
+    name === "TimeoutError" ||
+    name === "AbortError" ||
+    ["ETIMEOUT", "ETIMEDOUT"].includes(upper)
+  ) {
+    phase = "timeout";
+  } else if (["ENOTFOUND", "EAI_AGAIN"].includes(upper)) {
+    phase = "dns";
+  } else if (
+    upper.includes("CERT") ||
+    upper.includes("TLS") ||
+    upper.includes("SSL")
+  ) {
+    phase = "tls";
+  } else if (
+    [
+      "ECONNREFUSED",
+      "ECONNRESET",
+      "ENETUNREACH",
+      "EHOSTUNREACH",
+      "EPIPE",
+    ].includes(upper)
+  ) {
+    phase = "connect";
+  }
+  return {
+    ok: false,
+    phase,
+    ...(code ? { errorCode: code.slice(0, 80) } : {}),
+    ...(name ? { errorName: name } : {}),
+  };
+}
+
+function normalizeDeliveryResult(
+  result: boolean | DeliveryResult,
+): DeliveryResult {
+  return typeof result === "boolean"
+    ? result
+      ? { ok: true, httpStatus: 200 }
+      : { ok: false, phase: "unknown" }
+    : result;
+}
+
+function diagnosticPath(
+  directory: string,
+  turn: string,
+  destination: Destination,
+): string {
+  return join(
+    directory,
+    `delivery-${turn}-${destinationDigest(destination)}.json`,
+  );
+}
+
+export function writeDeliveryDiagnostic(
+  directory: string,
+  turn: string,
+  destination: Destination,
+  result: DeliveryResult,
+): void {
+  ensurePrivateDirectory(directory);
+  const path = diagnosticPath(directory, turn, destination);
+  let attempt = 1;
+  try {
+    const previous = JSON.parse(readFileSync(path, "utf8")) as {
+      attempt?: unknown;
+    };
+    if (
+      typeof previous.attempt === "number" &&
+      Number.isSafeInteger(previous.attempt) &&
+      previous.attempt > 0
+    ) {
+      attempt = previous.attempt + 1;
+    }
+  } catch {
+    // The first attempt has no prior diagnostic.
+  }
+  const diagnostic: DeliveryDiagnostic = {
+    version: 1,
+    timestamp: Math.floor(Date.now() / 1_000),
+    destinationType: destination.type,
+    outcome: result.ok ? "sent" : "failed",
+    attempt,
+    ...(!result.ok
+      ? {
+          phase: result.phase,
+          ...(result.errorCode ? { errorCode: result.errorCode } : {}),
+          ...(result.errorName ? { errorName: result.errorName } : {}),
+        }
+      : {}),
+    ...(result.httpStatus !== undefined
+      ? { httpStatus: result.httpStatus }
+      : {}),
+  };
+  const temporary = `${path}.${process.pid}.tmp`;
+  writeFileSync(temporary, JSON.stringify(diagnostic), {
+    mode: 0o600,
+    flag: "wx",
+  });
+  renameSync(temporary, path);
+}
+
+export function writeWorkerDiagnostic(
+  digest: string,
+  outcome: string,
+  error?: unknown,
+): void {
+  const directory = stateDirectory();
+  ensurePrivateDirectory(directory);
+  const path = join(directory, `worker-${digest}.json`);
+  const temporary = `${path}.${process.pid}.tmp`;
+  const name = error instanceof Error ? error.name.slice(0, 80) : undefined;
+  const code = errorCode(error);
+  writeFileSync(
+    temporary,
+    JSON.stringify({
+      version: 1,
+      timestamp: Math.floor(Date.now() / 1_000),
+      outcome,
+      ...(name ? { errorName: name } : {}),
+      ...(code ? { errorCode: code.slice(0, 80) } : {}),
+    }),
+    { mode: 0o600, flag: "wx" },
+  );
+  renameSync(temporary, path);
+}
+
+function tryWriteDeliveryDiagnostic(
+  directory: string,
+  turn: string,
+  destination: Destination,
+  result: DeliveryResult,
+): void {
+  try {
+    writeDeliveryDiagnostic(directory, turn, destination, result);
+  } catch (error) {
+    debug(`delivery diagnostic failed: ${String(error)}`);
+  }
+}
+
+function tryWriteWorkerDiagnostic(
+  digest: string,
+  outcome: string,
+  error?: unknown,
+): void {
+  try {
+    writeWorkerDiagnostic(digest, outcome, error);
+  } catch (diagnosticError) {
+    debug(`worker diagnostic failed: ${String(diagnosticError)}`);
   }
 }
 
@@ -423,7 +622,7 @@ async function withPresenceLock<T>(work: () => Promise<T>): Promise<T | null> {
   const directory = stateDirectory();
   const lock = join(directory, "presence.lock");
   try {
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    ensurePrivateDirectory(directory);
     mkdirSync(lock, { mode: 0o700 });
   } catch {
     return null;
@@ -637,7 +836,7 @@ export async function sendDestination(
   destination: Destination,
   status: TerminalStatus,
   fetcher: typeof fetch = fetch,
-): Promise<boolean> {
+): Promise<DeliveryResult> {
   const { title, body, tags } = notificationText(status);
   try {
     if (destination.type === "ntfy") {
@@ -647,7 +846,9 @@ export async function sendDestination(
         headers: { Title: title, Tags: tags, Cache: "no" },
         signal: AbortSignal.timeout(10_000),
       });
-      return response.ok;
+      return response.ok
+        ? { ok: true, httpStatus: response.status }
+        : { ok: false, phase: "http", httpStatus: response.status };
     }
     const response = await fetcher(
       `https://api.telegram.org/bot${destination.bot_token}/sendMessage`,
@@ -661,12 +862,59 @@ export async function sendDestination(
         signal: AbortSignal.timeout(10_000),
       },
     );
-    if (!response.ok) return false;
-    const result = (await response.json()) as { ok?: unknown };
-    return result.ok === true;
-  } catch {
-    return false;
+    if (!response.ok)
+      return { ok: false, phase: "http", httpStatus: response.status };
+    try {
+      const result = (await response.json()) as { ok?: unknown };
+      return result.ok === true
+        ? { ok: true, httpStatus: response.status }
+        : { ok: false, phase: "response", httpStatus: response.status };
+    } catch (error) {
+      const failure = deliveryFailure(error);
+      return {
+        ...failure,
+        ok: false,
+        phase: "response",
+        httpStatus: response.status,
+      };
+    }
+  } catch (error) {
+    return deliveryFailure(error);
   }
+}
+
+export async function probeDestination(
+  destination: Destination,
+  fetcher: typeof fetch = fetch,
+): Promise<DeliveryResult> {
+  try {
+    const endpoint =
+      destination.type === "ntfy"
+        ? new URL(destination.url).origin
+        : "https://api.telegram.org";
+    const response = await fetcher(endpoint, {
+      method: "HEAD",
+      redirect: "manual",
+      signal: AbortSignal.timeout(10_000),
+    });
+    return response.status > 0 && response.status < 500
+      ? { ok: true, httpStatus: response.status }
+      : { ok: false, phase: "http", httpStatus: response.status };
+  } catch (error) {
+    return deliveryFailure(error);
+  }
+}
+
+export function deliveryResultText(result: DeliveryResult): string {
+  if (result.ok) return `HTTP ${result.httpStatus}`;
+  return [
+    `phase=${result.phase}`,
+    result.errorCode ? `code=${result.errorCode}` : "",
+    result.errorName ? `error=${result.errorName}` : "",
+    result.httpStatus !== undefined ? `HTTP=${result.httpStatus}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 function writeMarker(path: string, outcome: string): void {
@@ -730,7 +978,7 @@ export async function processTurn(
   supplied: ProcessTurnOptions = {},
 ): Promise<string> {
   const directory = supplied.state ?? stateDirectory();
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  ensurePrivateDirectory(directory);
   const digest = turnDigest(threadId, turnId);
   const skippedMarker = join(directory, `skipped-${digest}`);
   const maximumWaitMilliseconds =
@@ -778,8 +1026,22 @@ export async function processTurn(
     if (pending.length === 0) return "duplicate";
     let failures = 0;
     for (const [destination, marker] of pending) {
-      if (await sender(destination, status)) writeMarker(marker, "sent");
-      else failures += 1;
+      let result: DeliveryResult;
+      try {
+        result = normalizeDeliveryResult(await sender(destination, status));
+      } catch (error) {
+        result = deliveryFailure(error);
+      }
+      if (result.ok) {
+        writeMarker(marker, "sent");
+        tryWriteDeliveryDiagnostic(directory, digest, destination, result);
+      } else {
+        tryWriteDeliveryDiagnostic(directory, digest, destination, result);
+        console.error(
+          `codex-notify: ${destination.type} delivery failed (${deliveryResultText(result)})`,
+        );
+        failures += 1;
+      }
     }
     return failures ? "send-failed" : "sent";
   } finally {
@@ -789,7 +1051,7 @@ export async function processTurn(
 
 export function writeWorkerRequest(request: WorkerRequest): string {
   const directory = stateDirectory();
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  ensurePrivateDirectory(directory);
   const digest = turnDigest(request.threadId, request.turnId);
   const path = join(directory, `request-${digest}.json`);
   const temporary = `${path}.${process.pid}.tmp`;
@@ -822,25 +1084,35 @@ export function readWorkerRequest(
   }
 }
 
-function isRunningFromSource(): boolean {
-  return process.argv[1] === import.meta.path;
+export function workerCommand(
+  digest: string,
+  executable = process.execPath,
+  modulePath = import.meta.path,
+): string[] {
+  return modulePath.startsWith("/$bunfs/")
+    ? [executable, "--worker", digest]
+    : [executable, modulePath, "--worker", digest];
 }
 
-export function workerCommand(digest: string): string[] {
-  return isRunningFromSource()
-    ? [process.execPath, import.meta.path, "--worker", digest]
-    : [process.execPath, "--worker", digest];
-}
-
-export function spawnWorker(request: WorkerRequest): void {
+export function spawnWorker(
+  request: WorkerRequest,
+  spawn: typeof Bun.spawn = Bun.spawn,
+): void {
   const digest = writeWorkerRequest(request);
-  const subprocess = Bun.spawn({
-    cmd: workerCommand(digest),
-    stdin: "ignore",
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  subprocess.unref();
+  tryWriteWorkerDiagnostic(digest, "spawning");
+  try {
+    const subprocess = spawn({
+      cmd: workerCommand(digest),
+      detached: true,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    subprocess.unref();
+  } catch (error) {
+    tryWriteWorkerDiagnostic(digest, "spawn-failed", error);
+    throw error;
+  }
 }
 
 export async function checkConfiguration(): Promise<number> {
@@ -869,10 +1141,15 @@ export async function sendTestNotification(): Promise<number> {
   }
   let failures = 0;
   for (const destination of config.destinations) {
-    if (await sendDestination(destination, "completed"))
-      console.log(`Test sent: ${destination.type}`);
-    else {
-      console.error(`Test failed: ${destination.type}`);
+    const result = await sendDestination(destination, "completed");
+    if (result.ok) {
+      console.log(
+        `Test sent: ${destination.type} (${deliveryResultText(result)})`,
+      );
+    } else {
+      console.error(
+        `Test failed: ${destination.type} (${deliveryResultText(result)})`,
+      );
       failures += 1;
     }
   }
@@ -884,6 +1161,28 @@ export async function diagnosePlatform(): Promise<number> {
   console.log(
     `Completion database: ${existsSync(historyDatabase()) ? "available" : "hook event fallback"}`,
   );
+  for (const name of [
+    "CODEX_NETWORK_PROXY_ACTIVE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NODE_USE_ENV_PROXY",
+  ]) {
+    console.log(`${name}: ${envPath(name) ? "configured" : "not configured"}`);
+  }
+  try {
+    const config = loadConfig();
+    for (const destination of config.destinations) {
+      const result = await probeDestination(destination);
+      console.log(
+        `Destination ${destination.type} connectivity: ${result.ok ? "available" : "unavailable"} (${deliveryResultText(result)})`,
+      );
+    }
+  } catch (error) {
+    console.log(
+      `Destination connectivity: configuration unavailable (${error instanceof Error ? error.name : "Error"})`,
+    );
+  }
   if (platform() === "darwin") {
     console.log(
       `Idle-time API: ${macIdleSeconds() === null ? "unavailable" : "available"}`,
@@ -947,12 +1246,18 @@ export async function main(args = commandLineArguments()): Promise<number> {
   if (args.length === 1 && args[0] === "--test") return sendTestNotification();
   if (args.length === 1 && args[0] === "--diagnose") return diagnosePlatform();
   if (args.length === 2 && args[0] === "--worker") {
-    const loaded = readWorkerRequest(args[1]!);
-    if (!loaded) return 1;
+    const digest = args[1]!;
+    const loaded = readWorkerRequest(digest);
+    if (!loaded) {
+      tryWriteWorkerDiagnostic(digest, "invalid-request");
+      return 1;
+    }
+    tryWriteWorkerDiagnostic(digest, "started");
     let config: NotifyConfig;
     try {
       config = loadConfig();
-    } catch {
+    } catch (error) {
+      tryWriteWorkerDiagnostic(digest, "config-failed", error);
       return 1;
     }
     const outcome = await processTurn(
@@ -961,14 +1266,16 @@ export async function main(args = commandLineArguments()): Promise<number> {
       loaded.request.turnId,
       loaded.request.status,
     );
+    tryWriteWorkerDiagnostic(digest, outcome);
     if (["sent", "skipped-present", "duplicate"].includes(outcome)) {
       try {
         unlinkSync(loaded.path);
       } catch {
         // Another duplicate worker already removed it.
       }
+      return 0;
     }
-    return outcome === "send-failed" ? 1 : 0;
+    return 1;
   }
   if (args.length !== 1) return 2;
   let event: Record<string, unknown>;
@@ -986,11 +1293,16 @@ export async function main(args = commandLineArguments()): Promise<number> {
   const status = TERMINAL_TURN_STATUSES.has(String(event.status))
     ? (event.status as TerminalStatus)
     : "completed";
-  spawnWorker({
-    threadId: event["thread-id"],
-    turnId: event["turn-id"],
-    status,
-  });
+  try {
+    spawnWorker({
+      threadId: event["thread-id"],
+      turnId: event["turn-id"],
+      status,
+    });
+  } catch (error) {
+    console.error(`codex-notify: worker spawn failed (${String(error)})`);
+    return 1;
+  }
   return 0;
 }
 
